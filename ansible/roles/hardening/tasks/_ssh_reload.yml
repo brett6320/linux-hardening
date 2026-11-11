@@ -1,0 +1,30 @@
+---
+# Internal: make sshd pick up its configuration.
+# Inputs: harden_ssh_socket (bool, Ubuntu ssh.socket activation),
+#         harden_ssh_port_changed (bool)
+- name: SSH reload | regenerate socket units for new port
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: harden_ssh_socket | bool and harden_ssh_port_changed | bool
+  tags: [always]
+
+- name: SSH reload | restart ssh.socket on port change
+  ansible.builtin.systemd_service:
+    name: ssh.socket
+    state: restarted
+  when: harden_ssh_socket | bool and harden_ssh_port_changed | bool
+  tags: [always]
+
+- name: SSH reload | reload socket-activated ssh.service
+  ansible.builtin.command:
+    argv: [systemctl, try-reload-or-restart, ssh.service]
+  changed_when: true
+  when: harden_ssh_socket | bool and not harden_ssh_port_changed | bool
+  tags: [always]
+
+- name: SSH reload | reload sshd
+  ansible.builtin.systemd_service:
+    name: "{{ harden_ssh_service }}"
+    state: reloaded
+  when: not harden_ssh_socket | bool
+  tags: [always]

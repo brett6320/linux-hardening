@@ -1,0 +1,49 @@
+---
+# Internal: ensure one line in a file with backup-before-change.
+# Input: harden_l = {path, line, regexp?, insertafter?, insertbefore?,
+#                    backrefs?, create?, mode?}
+- name: Line | predict change
+  ansible.builtin.lineinfile:
+    path: "{{ harden_l.path }}"
+    line: "{{ harden_l.line }}"
+    regexp: "{{ harden_l.regexp | default(omit) }}"
+    insertafter: "{{ harden_l.insertafter | default(omit) }}"
+    insertbefore: "{{ harden_l.insertbefore | default(omit) }}"
+    backrefs: "{{ harden_l.backrefs | default(omit) }}"
+    create: "{{ harden_l.create | default(false) }}"
+    mode: "{{ (harden_l.mode | default('0644')) if (harden_l.create | default(false)) else omit }}"
+  check_mode: true
+  register: harden_l_pred
+  tags: [always]
+
+- name: Line | evaluate prediction
+  ansible.builtin.set_fact:
+    harden_l_will_change: "{{ harden_l_pred is changed }}"
+  tags: [always]
+
+- name: Line | back up before change
+  ansible.builtin.include_tasks: _backup.yml
+  vars:
+    harden_bk_path: "{{ harden_l.path }}"
+  when: harden_l_will_change | bool
+  tags: [always]
+
+- name: Line | apply
+  ansible.builtin.lineinfile:
+    path: "{{ harden_l.path }}"
+    line: "{{ harden_l.line }}"
+    regexp: "{{ harden_l.regexp | default(omit) }}"
+    insertafter: "{{ harden_l.insertafter | default(omit) }}"
+    insertbefore: "{{ harden_l.insertbefore | default(omit) }}"
+    backrefs: "{{ harden_l.backrefs | default(omit) }}"
+    create: "{{ harden_l.create | default(false) }}"
+    mode: "{{ (harden_l.mode | default('0644')) if (harden_l.create | default(false)) else omit }}"
+  when: harden_l_will_change | bool
+  tags: [always]
+
+- name: Line | track change
+  ansible.builtin.set_fact:
+    harden_grp_changed: true
+    harden_changed_files: "{{ harden_changed_files + [harden_l.path] }}"
+  when: harden_l_will_change | bool
+  tags: [always]

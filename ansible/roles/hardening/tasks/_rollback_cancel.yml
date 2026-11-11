@@ -1,0 +1,59 @@
+---
+# Internal: cancel the pending rollback timer of harden_grp.
+# Strict mode (default) fails if the timer already fired, i.e. the change was
+# rolled back before connectivity was confirmed. Firing is detected by the
+# timer no longer being active (RemainAfterElapse=no), the marker file the
+# rollback script touches, or the rollback service having started.
+# Rescue paths pass harden_rb_strict: false.
+- name: Rollback | check that the rollback timer is still pending
+  ansible.builtin.command:
+    argv: [systemctl, is-active, "hardening-rollback-{{ harden_grp }}.timer"]
+  register: harden_rb_active
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+  tags: [always]
+
+- name: Rollback | cancel rollback timer
+  ansible.builtin.command:
+    argv: [systemctl, stop, "hardening-rollback-{{ harden_grp }}.timer"]
+  changed_when: true
+  failed_when: false
+  when: not ansible_check_mode
+  tags: [always]
+
+- name: Rollback | check for the fired marker
+  ansible.builtin.stat:
+    path: "{{ harden_backup_dir }}/rollback-{{ harden_grp }}.fired"
+    get_checksum: false
+  register: harden_rb_marker
+  when: not ansible_check_mode
+  tags: [always]
+
+- name: Rollback | check whether the rollback service started
+  ansible.builtin.command:
+    argv: [systemctl, show, -p, ActiveState, --value, "hardening-rollback-{{ harden_grp }}.service"]
+  register: harden_rb_svc
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+  tags: [always]
+
+- name: Rollback | fail if the rollback already ran
+  ansible.builtin.fail:
+    msg: >-
+      The auto-rollback timer for group {{ harden_grp }} fired before connectivity was confirmed
+      (increase harden_rollback_seconds); the change has been rolled back.
+      [timer={{ harden_rb_active.stdout | default('') | trim }},
+      marker={{ harden_rb_marker.stat.exists | default(false) }},
+      service={{ harden_rb_svc.stdout | default('') | trim }}]
+  when:
+    - not ansible_check_mode
+    - harden_rb_strict | default(true) | bool
+    - >-
+      (harden_rb_active.stdout | default('') | trim) != 'active'
+      or harden_rb_marker.stat.exists | default(false)
+      or (harden_rb_svc.stdout | default('') | trim) not in ['', 'inactive']
+  tags: [always]

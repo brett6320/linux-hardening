@@ -1,0 +1,12 @@
+---
+# Internal: record a warning for the current group. Input: harden_warn_msg
+- name: Warn | record warning
+  ansible.builtin.set_fact:
+    harden_warn: >-
+      {{ harden_warn | combine({harden_grp: (harden_warn[harden_grp] | default([])) + [harden_warn_msg]}) }}
+  tags: [always]
+
+- name: Warn | show warning
+  ansible.builtin.debug:
+    msg: "WARNING [{{ harden_grp }}]: {{ harden_warn_msg }}"
+  tags: [always]

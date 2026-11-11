@@ -1,0 +1,88 @@
+---
+# Internal: back up one path before it is modified (safety rule 4).
+# Input: harden_bk_path. Uses harden_grp for the per-group rollback list.
+# The first backup of a path in a run wins (it holds the original).
+- name: Backup | save original before change
+  when: harden_bk_path not in harden_backed_up
+  tags: [always]
+  block:
+    - name: Backup | stat original
+      ansible.builtin.stat:
+        path: "{{ harden_bk_path }}"
+        get_checksum: false
+      register: harden_bk_stat
+
+    - name: Backup | ensure backup directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      loop:
+        - "{{ harden_backup_root }}"
+        - "{{ harden_backup_dir }}"
+        - "{{ harden_backup_dir ~ (harden_bk_path | dirname) }}"
+
+    - name: Backup | copy original
+      ansible.builtin.copy:
+        src: "{{ harden_bk_path }}"
+        dest: "{{ harden_backup_dir ~ harden_bk_path }}"
+        remote_src: true
+        mode: preserve
+        force: false
+      when: harden_bk_stat.stat.exists and harden_bk_stat.stat.isreg
+
+    - name: Backup | record in manifest
+      ansible.builtin.lineinfile:
+        path: "{{ harden_backup_dir }}/manifest"
+        line: "{{ 'modified' if harden_bk_stat.stat.exists else 'created' }} {{ harden_bk_path }}"
+        create: true
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Backup | remember path
+      ansible.builtin.set_fact:
+        harden_backed_up: "{{ harden_backed_up + [harden_bk_path] }}"
+        harden_backups: >-
+          {{ harden_backups | combine({harden_grp: (harden_backups[harden_grp] | default([]))
+             + [{'path': harden_bk_path, 'created': not harden_bk_stat.stat.exists}]}) }}
+
+# A path already backed up by an earlier group (e.g. hardening.nft touched by
+# the ssh group's pre-open) still needs this group's own pre-change snapshot
+# so that this group's auto-rollback returns to the state it started from.
+- name: Backup | snapshot for this group's rollback
+  when:
+    - harden_bk_path in harden_backed_up
+    - harden_bk_path not in (harden_backups[harden_grp] | default([]) | map(attribute='path') | list)
+  tags: [always]
+  block:
+    - name: Backup | stat current file
+      ansible.builtin.stat:
+        path: "{{ harden_bk_path }}"
+        get_checksum: false
+      register: harden_bk_snap_stat
+
+    - name: Backup | ensure snapshot directory exists
+      ansible.builtin.file:
+        path: "{{ harden_backup_dir }}/rollback-{{ harden_grp }}{{ harden_bk_path | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Backup | copy current file to snapshot
+      ansible.builtin.copy:
+        src: "{{ harden_bk_path }}"
+        dest: "{{ harden_backup_dir }}/rollback-{{ harden_grp }}{{ harden_bk_path }}"
+        remote_src: true
+        mode: preserve
+      when: harden_bk_snap_stat.stat.exists and harden_bk_snap_stat.stat.isreg
+
+    - name: Backup | remember snapshot
+      ansible.builtin.set_fact:
+        harden_backups: >-
+          {{ harden_backups | combine({harden_grp: (harden_backups[harden_grp] | default([]))
+             + [{'path': harden_bk_path, 'created': not harden_bk_snap_stat.stat.exists,
+                 'src': harden_backup_dir ~ '/rollback-' ~ harden_grp ~ harden_bk_path}]}) }}

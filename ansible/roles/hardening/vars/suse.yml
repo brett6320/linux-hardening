@@ -1,0 +1,18 @@
+---
+# openSUSE Leap / Tumbleweed / SLES specifics.
+harden_ssh_service: sshd
+harden_chrony_service: chronyd
+harden_auditd_package: audit
+harden_firewall_backend: firewalld
+harden_fail2ban_banaction: firewallcmd-rich-rules
+harden_base_packages:
+  - audit
+  - chrony
+  - firewalld
+harden_fail2ban_packages:
+  - fail2ban
+# Security patches are applied by our own systemd timer running zypper.
+harden_update_packages: []
+harden_apparmor_packages:
+  - apparmor-parser
+  - apparmor-utils

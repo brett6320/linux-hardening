@@ -1,0 +1,19 @@
+---
+# SSH and firewall changes are deliberately NOT handlers: they need the
+# auto-rollback + reconnect sequence in tasks (see tasks/ssh.yml, firewall.yml).
+- name: Restart fail2ban
+  ansible.builtin.systemd_service:
+    name: fail2ban
+    state: restarted
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Restart journald
+  ansible.builtin.systemd_service:
+    name: systemd-journald
+    state: restarted
+
+- name: Restart rsyslog
+  ansible.builtin.systemd_service:
+    name: rsyslog
+    state: restarted
+  ignore_errors: "{{ ansible_check_mode }}"

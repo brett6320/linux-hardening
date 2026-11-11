@@ -1,0 +1,153 @@
+---
+# Control group: mac (SPEC "mac"): SELinux on rhel (and suse where shipped),
+# AppArmor on debian and suse otherwise.
+- name: MAC | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: mac
+
+- name: MAC | stat SELinux configuration
+  ansible.builtin.stat:
+    path: /etc/selinux/config
+  register: harden_mac_selinux_cfg
+
+- name: MAC | choose MAC framework
+  ansible.builtin.set_fact:
+    harden_mac_kind: >-
+      {{ 'selinux' if harden_family == 'rhel'
+         or (harden_family == 'suse' and harden_mac_selinux_cfg.stat.exists) else 'apparmor' }}
+
+# ---------------------------------------------------------------- SELinux
+- name: MAC | SELinux
+  when: harden_mac_kind == 'selinux'
+  block:
+    - name: MAC | read SELinux mode
+      ansible.builtin.command:
+        argv: [getenforce]
+      register: harden_mac_getenforce
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: MAC | evaluate SELinux mode
+      ansible.builtin.set_fact:
+        harden_mac_mode: "{{ (harden_mac_getenforce.stdout | default('') | trim) if harden_mac_getenforce.rc == 0 else 'Disabled' }}"
+
+    - name: MAC | SELinux disabled -> configure permissive
+      ansible.builtin.include_tasks: _line.yml
+      vars:
+        harden_l:
+          path: /etc/selinux/config
+          regexp: '^SELINUX='
+          line: SELINUX=permissive
+          create: true
+          mode: "0644"
+      when: harden_mac_mode == 'Disabled'
+
+    - name: MAC | warn about relabel/reboot
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: >-
+          SELinux was disabled; set to permissive in /etc/selinux/config. Reboot (full relabel) required,
+          then re-run to switch to enforcing.
+      when: harden_mac_mode == 'Disabled'
+
+    - name: MAC | flag reboot for SELinux
+      ansible.builtin.set_fact:
+        harden_reboot_reasons: "{{ harden_reboot_reasons + ['SELinux disabled -> permissive (relabel)'] }}"
+      when: harden_mac_mode == 'Disabled'
+
+    - name: MAC | look for recent AVC denials
+      ansible.builtin.command:
+        argv: [ausearch, -m, avc, -ts, today]
+      register: harden_mac_avc
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: harden_mac_mode == 'Permissive'
+
+    - name: MAC | evaluate denials
+      ansible.builtin.set_fact:
+        harden_mac_has_avc: >-
+          {{ harden_mac_mode == 'Permissive' and harden_mac_avc.rc | default(1) == 0
+             and (harden_mac_avc.stdout | default('')) is search('type=AVC') }}
+
+    - name: MAC | warn and stay permissive because of denials
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: >-
+          SELinux is permissive and AVC denials were logged today; staying permissive
+          (review with ausearch -m avc -ts today, or set harden_selinux_force=true).
+      when: harden_mac_has_avc | bool and not harden_selinux_force | bool
+
+    - name: MAC | switch to enforcing now
+      ansible.builtin.command:
+        argv: [setenforce, "1"]
+      changed_when: true
+      register: harden_mac_setenforce
+      when: harden_mac_mode == 'Permissive' and (not harden_mac_has_avc | bool or harden_selinux_force | bool)
+
+    - name: MAC | persist enforcing
+      ansible.builtin.include_tasks: _line.yml
+      vars:
+        harden_l:
+          path: /etc/selinux/config
+          regexp: '^SELINUX='
+          line: SELINUX=enforcing
+      when: >-
+        harden_mac_mode == 'Enforcing'
+        or (harden_mac_mode == 'Permissive' and (not harden_mac_has_avc | bool or harden_selinux_force | bool))
+
+# ---------------------------------------------------------------- AppArmor
+- name: MAC | AppArmor
+  when: harden_mac_kind == 'apparmor'
+  block:
+    - name: MAC | install AppArmor packages
+      ansible.builtin.include_tasks: _pkgs.yml
+      vars:
+        harden_pkgs: "{{ harden_apparmor_packages }}"
+
+    - name: MAC | check whether AppArmor is enabled in the kernel
+      ansible.builtin.slurp:
+        src: /sys/module/apparmor/parameters/enabled
+      register: harden_mac_aa_kernel
+      failed_when: false
+
+    - name: MAC | evaluate AppArmor kernel support
+      ansible.builtin.set_fact:
+        harden_mac_aa_on: "{{ (harden_mac_aa_kernel.content | default('') | b64decode | trim) == 'Y' }}"
+
+    - name: MAC | warn when AppArmor is not enabled in the kernel
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: AppArmor is not enabled in the kernel (container or boot parameter); service enabled only.
+      when: not harden_mac_aa_on | bool
+
+    - name: MAC | enable apparmor service
+      ansible.builtin.systemd_service:
+        name: apparmor
+        enabled: true
+      register: harden_mac_aa
+
+    # A start failure (e.g. container) is a warning only.
+    - name: MAC | start apparmor service
+      ansible.builtin.systemd_service:
+        name: apparmor
+        state: started
+      register: harden_mac_aa_start
+      failed_when: false
+      when: harden_mac_aa_on | bool
+
+    - name: MAC | warn when AppArmor cannot start (e.g. container)
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: "apparmor could not be started: {{ harden_mac_aa_start.msg | default('') }}"
+      when: (harden_mac_aa_start.msg | default('')) is search('^(Unable to|Could not)')
+
+- name: MAC | record group result
+  ansible.builtin.include_tasks: _record.yml
+  vars:
+    harden_rec_regs:
+      - "{{ harden_mac_setenforce | default({}) }}"
+      - "{{ harden_mac_aa | default({}) }}"
+      - "{{ harden_mac_aa_start | default({}) }}"

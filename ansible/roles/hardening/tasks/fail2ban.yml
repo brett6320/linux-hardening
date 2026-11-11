@@ -1,0 +1,55 @@
+---
+# Control group: fail2ban (SPEC "fail2ban").
+- name: Fail2ban | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: fail2ban
+
+- name: Fail2ban | skip when not installed
+  ansible.builtin.set_fact:
+    harden_grp_skip: >-
+      {{ harden_fail2ban_unavailable | default('', true) or 'fail2ban is not installed' }}
+  when: "'fail2ban' not in ansible_facts['packages']"
+
+- name: Fail2ban | configure and enable
+  when: harden_grp_skip | length == 0
+  block:
+    - name: Fail2ban | write jail configuration
+      ansible.builtin.include_tasks: _file.yml
+      vars:
+        harden_f:
+          path: /etc/fail2ban/jail.d/99-hardening.local
+          content: |
+            # Managed by linux-hardening (ansible role "hardening"). Local edits are overwritten.
+            [DEFAULT]
+            bantime = {{ harden_fail2ban_bantime }}
+            bantime.increment = true
+            findtime = 10m
+            maxretry = {{ harden_fail2ban_maxretry }}
+            ignoreip = {{ (['127.0.0.1/8', '::1'] + harden_admin_sources + harden_fail2ban_ignoreip) | unique | join(' ') }}
+            backend = systemd
+            banaction = {{ harden_fail2ban_banaction }}
+
+            [sshd]
+            enabled = true
+            port = {{ harden_ssh_port }}
+
+    - name: Fail2ban | restart when configuration changed
+      ansible.builtin.debug:
+        msg: fail2ban configuration changed, restart scheduled
+      changed_when: true
+      notify: Restart fail2ban
+      when: "'/etc/fail2ban/jail.d/99-hardening.local' in harden_changed_files"
+
+    - name: Fail2ban | enable and start
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        enabled: true
+        state: started
+      register: harden_f2b_svc
+
+- name: Fail2ban | record group result
+  ansible.builtin.include_tasks: _record.yml
+  vars:
+    harden_rec_regs:
+      - "{{ harden_f2b_svc | default({}) }}"

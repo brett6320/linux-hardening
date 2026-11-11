@@ -1,0 +1,38 @@
+---
+# Internal: semanage port -a/-m -t ssh_port_t -p tcp <harden_ssh_port>
+- name: SSH SELinux | check for semanage
+  ansible.builtin.stat:
+    path: /usr/sbin/semanage
+  register: harden_semanage_stat
+  tags: [always]
+
+- name: SSH SELinux | install policycoreutils-python-utils
+  ansible.builtin.include_tasks: _pkgs.yml
+  vars:
+    harden_pkgs: [policycoreutils-python-utils]
+  when: not harden_semanage_stat.stat.exists
+  tags: [always]
+
+- name: SSH SELinux | list port labels
+  ansible.builtin.command:
+    argv: [semanage, port, -l]
+  register: harden_semanage_ports
+  changed_when: false
+  check_mode: false
+  tags: [always]
+
+- name: SSH SELinux | evaluate ssh_port_t ports
+  ansible.builtin.set_fact:
+    harden_ssh_port_labelled: >-
+      {{ (harden_ssh_port | string) in
+         (harden_semanage_ports.stdout_lines | select('match', '^ssh_port_t\s+tcp\s')
+          | map('regex_replace', '^ssh_port_t\s+tcp\s+', '') | join(', ')).split(', ') }}
+  tags: [always]
+
+- name: SSH SELinux | label port as ssh_port_t
+  ansible.builtin.shell: >-
+    semanage port -a -t ssh_port_t -p tcp {{ harden_ssh_port | int }}
+    || semanage port -m -t ssh_port_t -p tcp {{ harden_ssh_port | int }}
+  changed_when: true
+  when: not harden_ssh_port_labelled | bool
+  tags: [always]

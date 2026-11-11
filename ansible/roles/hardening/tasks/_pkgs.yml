@@ -1,0 +1,50 @@
+---
+# Internal: install or remove packages using ansible.builtin only.
+# apt/dnf/dnf5 go through ansible.builtin.package; zypper has no builtin
+# module, so SUSE uses rpm -q + zypper commands.
+# Input: harden_pkgs (list), harden_pkgs_state (present|absent, default present)
+- name: Packages | apply with package module
+  ansible.builtin.package:
+    name: "{{ harden_pkgs }}"
+    state: "{{ harden_pkgs_state | default('present') }}"
+  register: harden_pkgs_res
+  when: harden_family != 'suse' and harden_pkgs | length > 0
+  tags: [always]
+
+- name: Packages | query rpm database
+  ansible.builtin.command:
+    argv: "{{ ['rpm', '-q'] + harden_pkgs }}"
+  register: harden_pkgs_rpmq
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: harden_family == 'suse' and harden_pkgs | length > 0
+  tags: [always]
+
+- name: Packages | compute zypper work list
+  ansible.builtin.set_fact:
+    harden_pkgs_todo: >-
+      {% set missing = harden_pkgs_rpmq.stdout_lines | default([])
+         | select('match', '^package \\S+ is not installed')
+         | map('regex_replace', '^package (\\S+) is not installed.*$', '\\1') | list -%}
+      {{ missing if (harden_pkgs_state | default('present')) == 'present'
+         else (harden_pkgs | difference(missing)) }}
+  when: harden_family == 'suse' and harden_pkgs | length > 0
+  tags: [always]
+
+- name: Packages | apply with zypper
+  ansible.builtin.command:
+    argv: >-
+      {{ ['zypper', '--non-interactive',
+          ('install' if (harden_pkgs_state | default('present')) == 'present' else 'remove')]
+         + harden_pkgs_todo }}
+  register: harden_pkgs_zypper
+  changed_when: true
+  when: harden_family == 'suse' and harden_pkgs | length > 0 and harden_pkgs_todo | length > 0
+  tags: [always]
+
+- name: Packages | track change
+  ansible.builtin.set_fact:
+    harden_grp_changed: true
+  when: harden_pkgs_res is changed or harden_pkgs_zypper is changed
+  tags: [always]

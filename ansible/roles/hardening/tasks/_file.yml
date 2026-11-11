@@ -1,0 +1,61 @@
+---
+# Internal: manage the full content of one file with backup-before-change.
+# Input: harden_f = {path, content, mode?, owner?, group?, validate?}
+- name: File | stat parent directory
+  ansible.builtin.stat:
+    path: "{{ harden_f.path | dirname }}"
+    get_checksum: false
+  register: harden_f_dir
+  tags: [always]
+
+- name: File | predict change
+  ansible.builtin.copy:
+    dest: "{{ harden_f.path }}"
+    content: "{{ harden_f.content }}"
+    owner: "{{ harden_f.owner | default('root') }}"
+    group: "{{ harden_f.group | default('root') }}"
+    mode: "{{ harden_f.mode | default('0644') }}"
+  check_mode: true
+  register: harden_f_pred
+  when: harden_f_dir.stat.exists
+  tags: [always]
+
+- name: File | evaluate prediction
+  ansible.builtin.set_fact:
+    harden_f_will_change: "{{ (not harden_f_dir.stat.exists) or (harden_f_pred is changed) }}"
+  tags: [always]
+
+- name: File | back up before change
+  ansible.builtin.include_tasks: _backup.yml
+  vars:
+    harden_bk_path: "{{ harden_f.path }}"
+  when: harden_f_will_change | bool
+  tags: [always]
+
+- name: File | create parent directory
+  ansible.builtin.file:
+    path: "{{ harden_f.path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: not harden_f_dir.stat.exists
+  tags: [always]
+
+- name: File | write content
+  ansible.builtin.copy:
+    dest: "{{ harden_f.path }}"
+    content: "{{ harden_f.content }}"
+    owner: "{{ harden_f.owner | default('root') }}"
+    group: "{{ harden_f.group | default('root') }}"
+    mode: "{{ harden_f.mode | default('0644') }}"
+    validate: "{{ harden_f.validate | default(omit) }}"
+  when: harden_f_dir.stat.exists or not ansible_check_mode
+  tags: [always]
+
+- name: File | track change
+  ansible.builtin.set_fact:
+    harden_grp_changed: true
+    harden_changed_files: "{{ harden_changed_files + [harden_f.path] }}"
+  when: harden_f_will_change | bool
+  tags: [always]

@@ -1,0 +1,368 @@
+---
+# Control group: ssh (SPEC "ssh", safety rules 1, 3, 4, 5).
+- name: SSH | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: ssh
+
+- name: SSH | ensure privilege separation directory exists for sshd -t/-T
+  ansible.builtin.file:
+    path: /run/sshd
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  check_mode: false
+  changed_when: false
+  when: harden_family == 'debian'
+
+- name: SSH | read effective sshd configuration
+  ansible.builtin.command:
+    argv: [/usr/sbin/sshd, -T]
+  environment:
+    PATH: /usr/sbin:/usr/bin:/sbin:/bin
+  register: harden_ssh_t
+  changed_when: false
+  check_mode: false
+
+- name: SSH | read user database
+  ansible.builtin.getent:
+    database: passwd
+
+- name: SSH | read group database
+  ansible.builtin.getent:
+    database: group
+
+- name: SSH | derive current settings and admin candidates
+  ansible.builtin.set_fact:
+    harden_ssh_cfg: >-
+      {{ dict(harden_ssh_t.stdout_lines | map('regex_replace', '^(\S+).*$', '\1')
+              | zip(harden_ssh_t.stdout_lines | map('regex_replace', '^\S+\s*', ''))) }}
+    harden_ssh_ports_before: >-
+      {{ harden_ssh_t.stdout_lines | select('match', '^port ') | map('regex_replace', '^port ', '') | list }}
+    harden_ssh_allow_names: "{{ harden_ssh_allow_users | map('regex_replace', '@.*$', '') | list }}"
+    harden_ssh_candidates: >-
+      {% set ns = namespace(gids=[], members=[], out=[]) -%}
+      {% for g in ['sudo', 'wheel'] if g in ansible_facts['getent_group'] -%}
+      {% set ns.gids = ns.gids + [ansible_facts['getent_group'][g][1]] -%}
+      {% set ns.members = ns.members + (ansible_facts['getent_group'][g][2] | default('', true)).split(',') -%}
+      {% endfor -%}
+      {% for u, f in ansible_facts['getent_passwd'].items() -%}
+      {% if (f[1] | int) != 0
+            and not (f[5] | default('', true)) is search('(nologin|/false|/sync|/shutdown|/halt)$')
+            and (f[5] | default('', true)) | length > 0
+            and (u in ns.members or f[2] in ns.gids) -%}
+      {% set ns.out = ns.out + [u] -%}
+      {% endif -%}
+      {% endfor -%}
+      {{ ns.out }}
+
+- name: SSH | list authorized keys files of admin candidates
+  ansible.builtin.set_fact:
+    harden_ssh_keyfiles: >-
+      {% set ns = namespace(out=[]) -%}
+      {% set tokens = (harden_ssh_cfg['authorizedkeysfile'] | default('.ssh/authorized_keys')).split() -%}
+      {% for u in harden_ssh_candidates + (['root'] if 'root' in ansible_facts['getent_passwd'] else []) -%}
+      {% set home = ansible_facts['getent_passwd'][u][4] -%}
+      {% for t in tokens if t != 'none' -%}
+      {% set p = t | replace('%%', '@@PCT@@') | replace('%h', home) | replace('%u', u) | replace('@@PCT@@', '%') -%}
+      {% set ns.out = ns.out + [{'user': u, 'path': (p if p.startswith('/') else home ~ '/' ~ p)}] -%}
+      {% endfor -%}
+      {% endfor -%}
+      {{ ns.out }}
+
+- name: SSH | stat authorized keys files
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    get_checksum: false
+  loop: "{{ harden_ssh_keyfiles }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: harden_ssh_keystat
+
+- name: SSH | decide authentication settings (safety rule 1)
+  ansible.builtin.set_fact:
+    harden_ssh_missing_users: "{{ harden_ssh_allow_names | reject('in', ansible_facts['getent_passwd']) | list }}"
+    harden_ssh_root_has_keys: >-
+      {{ (harden_ssh_cfg['authorizedkeyscommand'] | default('none')) not in ['none', '']
+         or (harden_ssh_keystat.results | selectattr('item.user', 'equalto', 'root') | selectattr('stat.exists')
+             | selectattr('stat.size', 'gt', 0) | list | length > 0) }}
+    harden_ssh_key_users: >-
+      {% set akc = (harden_ssh_cfg['authorizedkeyscommand'] | default('none')) not in ['none', ''] -%}
+      {% set users = harden_ssh_candidates if akc else
+           (harden_ssh_keystat.results | selectattr('stat.exists') | selectattr('stat.size', 'gt', 0)
+            | map(attribute='item.user') | reject('equalto', 'root') | unique | list) -%}
+      {{ users | select('in', harden_ssh_allow_names) | list if harden_ssh_allow_names | length > 0 else users }}
+
+- name: SSH | derive drop-in values
+  ansible.builtin.set_fact:
+    harden_ssh_key_only: "{{ harden_ssh_key_users | length > 0 or harden_force_key_only | bool }}"
+    # deny -> "no", keys -> "prohibit-password", unset -> no PermitRootLogin line
+    # (no key-capable admin and root has no keys: prohibit-password could lock out a password-only root host)
+    # (values avoid "no"/"yes", which could be coerced to booleans)
+    harden_ssh_root_login: >-
+      {{ 'deny' if harden_ssh_key_users | length > 0 else ('keys' if harden_ssh_root_has_keys | bool else 'unset') }}
+    harden_ssh_port_changed: "{{ (harden_ssh_port | string) not in harden_ssh_ports_before }}"
+    harden_ssh_main: /etc/ssh/sshd_config
+    harden_ssh_dropin: /etc/ssh/sshd_config.d/00-hardening.conf
+    harden_ssh_kex: []
+    harden_ssh_ciphers: []
+    harden_ssh_macs: []
+
+- name: SSH | abort group when AllowUsers names do not exist
+  ansible.builtin.set_fact:
+    harden_grp_failed: "AllowUsers contains non-existent users: {{ harden_ssh_missing_users | join(', ') }}"
+  when: harden_ssh_missing_users | length > 0
+
+- name: SSH | warn when no key-capable admin user exists
+  ansible.builtin.include_tasks: _warn.yml
+  vars:
+    harden_warn_msg: >-
+      No key-capable sudo/wheel user{{ ' in AllowUsers' if harden_ssh_allow_names | length > 0 else '' }} found:
+      {{ 'PasswordAuthentication/KbdInteractiveAuthentication left on' if not harden_force_key_only | bool
+         else 'key-only forced by harden_force_key_only' }},
+      {{ 'PermitRootLogin prohibit-password' if harden_ssh_root_has_keys | bool
+         else 'PermitRootLogin left unset (root has no authorized keys)' }}.
+  when: harden_grp_failed | length == 0 and harden_ssh_key_users | length == 0
+
+- name: SSH | configure sshd
+  when: harden_grp_failed | length == 0
+  block:
+    - name: SSH | stat main configuration
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config
+        get_checksum: false
+      register: harden_ssh_main_stat
+
+    - name: SSH | read vendor configuration (SUSE /usr/etc)
+      ansible.builtin.slurp:
+        src: /usr/etc/ssh/sshd_config
+      register: harden_ssh_vendor
+      when: not harden_ssh_main_stat.stat.exists
+      failed_when: false
+
+    - name: SSH | warn when vendor configuration lacks the drop-in Include
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: >-
+          /etc/ssh/sshd_config is absent and /usr/etc/ssh/sshd_config has no Include of
+          /etc/ssh/sshd_config.d/*.conf; the drop-in may not take effect (not creating /etc/ssh/sshd_config).
+      when:
+        - not harden_ssh_main_stat.stat.exists
+        - not ((harden_ssh_vendor.content | default('') | b64decode) is search('(?m)^\s*Include\s+/etc/ssh/sshd_config\.d/'))
+
+    - name: SSH | query supported crypto algorithms
+      ansible.builtin.command:
+        argv: [ssh, -Q, "{{ item }}"]
+      environment:
+        PATH: /usr/sbin:/usr/bin:/sbin:/bin
+      loop: [kex, cipher, mac]
+      register: harden_ssh_q
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: harden_family in ['debian', 'suse'] and not harden_fips | bool
+
+    - name: SSH | filter crypto lists to supported algorithms (debian/suse, non-FIPS)
+      ansible.builtin.set_fact:
+        harden_ssh_kex: >-
+          {{ ['sntrup761x25519-sha512@openssh.com', 'mlkem768x25519-sha256', 'curve25519-sha256', 'curve25519-sha256@libssh.org']
+             | select('in', harden_ssh_q.results[0].stdout_lines | default([])) | list }}
+        harden_ssh_ciphers: >-
+          {{ ['chacha20-poly1305@openssh.com', 'aes256-gcm@openssh.com', 'aes128-gcm@openssh.com']
+             | select('in', harden_ssh_q.results[1].stdout_lines | default([])) | list }}
+        harden_ssh_macs: >-
+          {{ ['hmac-sha2-512-etm@openssh.com', 'hmac-sha2-256-etm@openssh.com']
+             | select('in', harden_ssh_q.results[2].stdout_lines | default([])) | list }}
+      when: harden_family in ['debian', 'suse'] and not harden_fips | bool
+
+    - name: SSH | warn when supported algorithms could not be queried
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: "ssh -Q failed (openssh client missing?); crypto settings left at defaults."
+      when:
+        - harden_family in ['debian', 'suse'] and not harden_fips | bool
+        - harden_ssh_q.results | selectattr('rc', 'defined') | rejectattr('rc', 'equalto', 0) | list | length > 0
+
+    - name: SSH | read system crypto policy (rhel)
+      ansible.builtin.command:
+        argv: [update-crypto-policies, --show]
+      register: harden_ssh_cp
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: harden_family == 'rhel' and not harden_fips | bool
+
+    - name: SSH | warn on LEGACY crypto policy
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: "System crypto policy is {{ harden_ssh_cp.stdout | trim }}; set at least DEFAULT (update-crypto-policies --set DEFAULT)."
+      when: harden_family == 'rhel' and not harden_fips | bool and (harden_ssh_cp.stdout | default('')) is match('LEGACY')
+
+    - name: SSH | detect Ubuntu ssh.socket activation
+      ansible.builtin.command:
+        argv: [systemctl, is-enabled, ssh.socket]
+      register: harden_ssh_sock
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: harden_family == 'debian'
+
+    - name: SSH | detect SELinux state
+      ansible.builtin.command:
+        argv: [getenforce]
+      register: harden_ssh_getenforce
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: SSH | evaluate environment
+      ansible.builtin.set_fact:
+        harden_ssh_socket: "{{ (harden_ssh_sock.stdout | default('') | trim) == 'enabled' }}"
+        harden_ssh_selinux: >-
+          {{ harden_ssh_getenforce.rc | default(1) == 0 and (harden_ssh_getenforce.stdout | trim) in ['Enforcing', 'Permissive'] }}
+        harden_ssh_dropin_content: "{{ lookup('ansible.builtin.template', 'sshd_hardening.conf.j2') }}"
+
+    - name: SSH | stat drop-in directory
+      ansible.builtin.stat:
+        path: /etc/ssh/sshd_config.d
+      register: harden_ssh_d_stat
+
+    - name: SSH | predict drop-in change
+      ansible.builtin.copy:
+        dest: "{{ harden_ssh_dropin }}"
+        content: "{{ harden_ssh_dropin_content }}"
+        owner: root
+        group: root
+        mode: "0600"
+      check_mode: true
+      register: harden_ssh_pred_dropin
+      when: harden_ssh_d_stat.stat.exists
+
+    - name: SSH | predict Include line change
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        line: Include /etc/ssh/sshd_config.d/*.conf
+        insertbefore: BOF
+      check_mode: true
+      register: harden_ssh_pred_include
+      when: harden_ssh_main_stat.stat.exists
+
+    - name: SSH | summarise predicted changes
+      ansible.builtin.set_fact:
+        harden_ssh_change_dropin: "{{ not harden_ssh_d_stat.stat.exists or harden_ssh_pred_dropin is changed }}"
+        harden_ssh_change_include: "{{ harden_ssh_pred_include is changed }}"
+
+    - name: SSH | report predicted change in check mode
+      ansible.builtin.set_fact:
+        harden_grp_changed: true
+      when: ansible_check_mode and (harden_ssh_change_dropin or harden_ssh_change_include)
+
+    - name: SSH | apply with auto-rollback
+      when: not ansible_check_mode and (harden_ssh_change_dropin or harden_ssh_change_include)
+      block:
+        - name: SSH | back up drop-in
+          ansible.builtin.include_tasks: _backup.yml
+          vars:
+            harden_bk_path: "{{ harden_ssh_dropin }}"
+          when: harden_ssh_change_dropin | bool
+
+        - name: SSH | back up main configuration
+          ansible.builtin.include_tasks: _backup.yml
+          vars:
+            harden_bk_path: /etc/ssh/sshd_config
+          when: harden_ssh_change_include | bool
+
+        - name: SSH | apply, validate, reload and reconnect
+          block:
+            # Slow, additive steps first so they do not eat into the rollback window.
+            - name: SSH | label new port for SELinux
+              ansible.builtin.include_tasks: _ssh_selinux_port.yml
+              when: harden_ssh_selinux | bool and (harden_ssh_port | int) != 22
+
+            - name: SSH | pre-open new port in the firewall (persistent)
+              ansible.builtin.include_tasks: _ssh_preopen.yml
+              when: harden_ssh_port_changed | bool
+
+            - name: SSH | schedule auto-rollback
+              ansible.builtin.include_tasks: _rollback_schedule.yml
+              vars:
+                harden_rb_reload: >-
+                  {{ 'systemctl daemon-reload; systemctl restart ssh.socket; systemctl try-reload-or-restart ssh.service'
+                     if harden_ssh_socket | bool else 'systemctl reload ' ~ harden_ssh_service }}
+
+            - name: SSH | write Include line
+              ansible.builtin.include_tasks: _line.yml
+              vars:
+                harden_l:
+                  path: /etc/ssh/sshd_config
+                  line: Include /etc/ssh/sshd_config.d/*.conf
+                  insertbefore: BOF
+              when: harden_ssh_change_include | bool
+
+            - name: SSH | write drop-in
+              ansible.builtin.include_tasks: _file.yml
+              vars:
+                harden_f:
+                  path: "{{ harden_ssh_dropin }}"
+                  content: "{{ harden_ssh_dropin_content }}"
+                  mode: "0600"
+
+            - name: SSH | validate full sshd configuration
+              ansible.builtin.command:
+                argv: [/usr/sbin/sshd, -t]
+              environment:
+                PATH: /usr/sbin:/usr/bin:/sbin:/bin
+              register: harden_ssh_validate
+              changed_when: false
+
+            - name: SSH | reload sshd
+              ansible.builtin.include_tasks: _ssh_reload.yml
+
+            - name: SSH | use new port for further connections
+              ansible.builtin.set_fact:
+                ansible_port: "{{ harden_ssh_port | int }}"
+                ansible_ssh_port: "{{ harden_ssh_port | int }}"
+              when: harden_ssh_port_changed | bool
+
+            - name: SSH | confirm connectivity with a new connection
+              ansible.builtin.include_tasks: _reconnect.yml
+
+            - name: SSH | cancel auto-rollback
+              ansible.builtin.include_tasks: _rollback_cancel.yml
+
+            - name: SSH | note port change for inventory
+              ansible.builtin.include_tasks: _warn.yml
+              vars:
+                harden_warn_msg: "sshd now listens on port {{ harden_ssh_port }}; update ansible_port in your inventory."
+              when: harden_ssh_port_changed | bool
+          rescue:
+            - name: SSH | go back to the original port
+              ansible.builtin.set_fact:
+                ansible_port: "{{ harden_ssh_ports_before[0] | default(22) | int }}"
+                ansible_ssh_port: "{{ harden_ssh_ports_before[0] | default(22) | int }}"
+
+            - name: SSH | reconnect on the original port
+              ansible.builtin.include_tasks: _reconnect.yml
+              when: harden_ssh_port_changed | bool
+
+            - name: SSH | restore backup immediately
+              ansible.builtin.command:
+                argv: [/bin/sh, "{{ harden_backup_dir }}/rollback-ssh.sh"]
+              register: harden_ssh_rb_now
+              changed_when: true
+              failed_when: false
+
+            - name: SSH | cancel rollback timer after manual restore
+              ansible.builtin.include_tasks: _rollback_cancel.yml
+              vars:
+                harden_rb_strict: false
+
+            - name: SSH | abort group
+              ansible.builtin.set_fact:
+                harden_grp_failed: >-
+                  {{ ansible_failed_task.name | default('ssh change') }} failed, backup restored:
+                  {{ (ansible_failed_result.stderr | default('') or ansible_failed_result.msg | default('')) | trim }}
+
+- name: SSH | record group result
+  ansible.builtin.include_tasks: _record.yml

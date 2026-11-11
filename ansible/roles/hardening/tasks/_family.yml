@@ -1,0 +1,70 @@
+---
+# Internal: OS detection + family vars. Shared by apply, verify and restore.
+- name: Preflight | map OS family (ID, then ID_LIKE via ansible facts)
+  ansible.builtin.set_fact:
+    harden_family: >-
+      {{ {'Debian': 'debian', 'RedHat': 'rhel', 'Suse': 'suse'}[ansible_facts['os_family']] | default('') }}
+  tags: [always]
+
+- name: Preflight | abort on unsupported distribution
+  ansible.builtin.assert:
+    that:
+      - harden_family | length > 0
+      - ansible_facts['service_mgr'] == 'systemd'
+    fail_msg: >-
+      Unsupported distribution {{ ansible_facts['distribution'] }} (os_family {{ ansible_facts['os_family'] }},
+      service manager {{ ansible_facts['service_mgr'] }}). Supported: debian, rhel, suse families with systemd.
+    quiet: true
+  tags: [always]
+
+- name: Preflight | load family variables
+  ansible.builtin.include_vars:
+    file: "{{ harden_family }}.yml"
+  tags: [always]
+
+- name: Preflight | check FIPS mode flag
+  ansible.builtin.stat:
+    path: /proc/sys/crypto/fips_enabled
+  register: harden_fips_stat
+  tags: [always]
+
+- name: Preflight | read FIPS mode flag
+  ansible.builtin.slurp:
+    src: /proc/sys/crypto/fips_enabled
+  register: harden_fips_raw
+  when: harden_fips_stat.stat.exists
+  tags: [always]
+
+- name: Preflight | check for python3-apt (needed by package_facts)
+  ansible.builtin.command:
+    argv: ["{{ ansible_facts['python']['executable'] }}", -c, import apt]
+  register: harden_pyapt
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: ansible_facts['os_family'] == 'Debian'
+  tags: [always]
+
+- name: Preflight | install python3-apt (bootstrap, also in check mode)
+  ansible.builtin.command:
+    argv: [apt-get, install, -y, --no-install-recommends, python3-apt]
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  changed_when: true
+  check_mode: false
+  when: ansible_facts['os_family'] == 'Debian' and harden_pyapt.rc != 0
+  tags: [always]
+
+- name: Preflight | gather installed packages
+  ansible.builtin.package_facts:
+    manager: auto
+  tags: [always]
+
+- name: Preflight | derived facts
+  ansible.builtin.set_fact:
+    harden_fips: "{{ harden_fips_stat.stat.exists and (harden_fips_raw.content | b64decode | trim) == '1' }}"
+    harden_is_fedora: "{{ ansible_facts['distribution'] == 'Fedora' }}"
+    harden_is_sles: "{{ ansible_facts['distribution'] in ['SLES', 'SLES_SAP', 'SLED'] }}"
+    harden_is_rhel_proper: "{{ ansible_facts['distribution'] == 'RedHat' }}"
+    harden_os_major: "{{ ansible_facts['distribution_major_version'] }}"
+  tags: [always]

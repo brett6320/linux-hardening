@@ -1,0 +1,165 @@
+---
+# Control group: fileperms (SPEC "fileperms").
+- name: Fileperms | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: fileperms
+
+- name: Fileperms | find SSH host keys
+  ansible.builtin.find:
+    paths: /etc/ssh
+    patterns: ["ssh_host_*_key", "ssh_host_*_key.pub"]
+  register: harden_fp_hostkeys
+
+- name: Fileperms | compute permission targets
+  ansible.builtin.set_fact:
+    harden_fp_targets: >-
+      {% set ns = namespace(out=[]) -%}
+      {% for f in harden_fp_hostkeys.files | sort(attribute='path') -%}
+      {% if f.path is search('\\.pub$') -%}
+      {% set ns.out = ns.out + [{'path': f.path, 'mode': '0644'}] -%}
+      {% elif f.gr_name == 'ssh_keys' -%}
+      {% set ns.out = ns.out + [{'path': f.path, 'mode': '0640'}] -%}
+      {% else -%}
+      {% set ns.out = ns.out + [{'path': f.path, 'mode': '0600'}] -%}
+      {% endif -%}
+      {% endfor -%}
+      {% set ns.out = ns.out + [
+           {'path': '/etc/shadow', 'mode': 'g-w,o-rwx'},
+           {'path': '/etc/gshadow', 'mode': 'g-w,o-rwx'},
+           {'path': '/etc/passwd', 'mode': '0644'},
+           {'path': '/etc/group', 'mode': '0644'},
+           {'path': '/etc/crontab', 'mode': '0600'},
+           {'path': '/etc/cron.d', 'mode': '0700'},
+           {'path': '/etc/cron.daily', 'mode': '0700'},
+           {'path': '/etc/cron.hourly', 'mode': '0700'},
+           {'path': '/etc/cron.weekly', 'mode': '0700'},
+           {'path': '/etc/cron.monthly', 'mode': '0700'},
+           {'path': '/boot/grub/grub.cfg', 'mode': '0600'},
+           {'path': '/boot/grub2/grub.cfg', 'mode': '0600'}] -%}
+      {{ ns.out }}
+
+- name: Fileperms | enforce file and directory modes
+  ansible.builtin.include_tasks: _perm.yml
+  vars:
+    harden_p: "{{ harden_fp_item }}"
+  loop: "{{ harden_fp_targets }}"
+  loop_control:
+    loop_var: harden_fp_item
+    label: "{{ harden_fp_item.path }}"
+
+# ---------------------------------------------------------------- /dev/shm
+- name: Fileperms | check /etc/fstab
+  ansible.builtin.stat:
+    path: /etc/fstab
+  register: harden_fp_fstab_stat
+
+- name: Fileperms | read /etc/fstab
+  ansible.builtin.slurp:
+    src: /etc/fstab
+  register: harden_fp_fstab
+  when: harden_fp_fstab_stat.stat.exists
+
+- name: Fileperms | evaluate /dev/shm fstab entry
+  ansible.builtin.set_fact:
+    harden_fp_shm_line: >-
+      {{ (harden_fp_fstab.content | default('') | b64decode).splitlines()
+         | select('match', '^\s*[^#\s]+\s+/dev/shm/?\s') | first | default('') }}
+
+- name: Fileperms | add /dev/shm fstab entry
+  ansible.builtin.include_tasks: _line.yml
+  vars:
+    harden_l:
+      path: /etc/fstab
+      line: tmpfs /dev/shm tmpfs defaults,nodev,nosuid,noexec 0 0
+      create: true
+      mode: "0644"
+  when: harden_fp_shm_line | length == 0
+
+- name: Fileperms | add missing options to existing /dev/shm entry
+  ansible.builtin.include_tasks: _line.yml
+  vars:
+    harden_fp_shm_fields: "{{ harden_fp_shm_line.split() }}"
+    harden_fp_shm_missing: "{{ ['nodev', 'nosuid', 'noexec'] | difference(harden_fp_shm_fields[3].split(',')) }}"
+    harden_l:
+      path: /etc/fstab
+      regexp: "^{{ harden_fp_shm_line | regex_escape }}$"
+      line: >-
+        {{ ([harden_fp_shm_fields[0], harden_fp_shm_fields[1], harden_fp_shm_fields[2],
+             (harden_fp_shm_fields[3].split(',') + harden_fp_shm_missing) | join(',')]
+            + harden_fp_shm_fields[4:]) | join(' ') }}
+  when:
+    - harden_fp_shm_line | length > 0
+    - harden_fp_shm_line.split() | length >= 4
+    - (['nodev', 'nosuid', 'noexec'] | difference(harden_fp_shm_line.split()[3].split(','))) | length > 0
+
+- name: Fileperms | read mount table
+  ansible.builtin.slurp:
+    src: /proc/self/mounts
+  register: harden_fp_mounts
+
+- name: Fileperms | parse /dev/shm and /tmp mounts
+  ansible.builtin.set_fact:
+    harden_fp_shm_mnt: >-
+      {{ ((harden_fp_mounts.content | b64decode).splitlines() | select('match', '^\S+ /dev/shm ') | list | last | default('- - - -')).split() }}
+    harden_fp_tmp_mnt: >-
+      {{ ((harden_fp_mounts.content | b64decode).splitlines() | select('match', '^\S+ /tmp ') | list | last | default('- - - -')).split() }}
+
+- name: Fileperms | remount /dev/shm
+  ansible.builtin.command:
+    argv: [mount, -o, "remount,nodev,nosuid,noexec", /dev/shm]
+  changed_when: true
+  register: harden_fp_shm_remount
+  when:
+    - harden_fp_shm_mnt[1] == '/dev/shm'
+    - (['nodev', 'nosuid', 'noexec'] | difference(harden_fp_shm_mnt[3].split(','))) | length > 0
+
+# ---------------------------------------------------------------- /tmp
+- name: Fileperms | inspect tmp.mount
+  ansible.builtin.command:
+    argv: [systemctl, show, -p, ActiveState, tmp.mount]
+  register: harden_fp_tmp
+  changed_when: false
+  check_mode: false
+
+- name: Fileperms | decide /tmp handling
+  ansible.builtin.set_fact:
+    harden_fp_tmp_managed: >-
+      {{ harden_fp_tmp.stdout is search('ActiveState=active') and harden_fp_tmp_mnt[2] == 'tmpfs' }}
+
+- name: Fileperms | harden tmpfs /tmp managed by tmp.mount
+  when: harden_fp_tmp_managed | bool
+  block:
+    - name: Fileperms | write tmp.mount drop-in
+      ansible.builtin.include_tasks: _file.yml
+      vars:
+        harden_f:
+          path: /etc/systemd/system/tmp.mount.d/99-hardening.conf
+          content: |
+            # Managed by linux-hardening (ansible role "hardening").
+            [Mount]
+            Options=mode=1777,strictatime,nosuid,nodev
+
+    - name: Fileperms | reload systemd for tmp.mount drop-in
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: "'/etc/systemd/system/tmp.mount.d/99-hardening.conf' in harden_changed_files"
+
+    - name: Fileperms | remount /tmp
+      ansible.builtin.command:
+        argv: [mount, -o, "remount,nosuid,nodev,strictatime", /tmp]
+      changed_when: true
+      register: harden_fp_tmp_remount
+      when: (['nosuid', 'nodev'] | difference(harden_fp_tmp_mnt[3].split(','))) | length > 0
+
+- name: Fileperms | report /tmp skipped
+  ansible.builtin.debug:
+    msg: "/tmp is not a tmpfs managed by tmp.mount; /tmp hardening skipped."
+  when: not harden_fp_tmp_managed | bool
+
+- name: Fileperms | record group result
+  ansible.builtin.include_tasks: _record.yml
+  vars:
+    harden_rec_regs:
+      - "{{ harden_fp_shm_remount | default({}) }}"
+      - "{{ harden_fp_tmp_remount | default({}) }}"

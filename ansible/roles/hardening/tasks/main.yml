@@ -1,0 +1,80 @@
+---
+# Entry point: preflight, one task file per control group (gated by its
+# harden_<group> toggle and tagged with the group name), then the summary.
+- name: Preflight
+  ansible.builtin.import_tasks: preflight.yml
+  tags: [always]
+
+- name: Group packages
+  ansible.builtin.import_tasks: packages.yml
+  when: harden_packages | bool
+  tags: [packages]
+
+- name: Group updates
+  ansible.builtin.import_tasks: updates.yml
+  when: harden_updates | bool
+  tags: [updates]
+
+- name: Group ssh
+  ansible.builtin.import_tasks: ssh.yml
+  when: harden_ssh | bool
+  tags: [ssh]
+
+- name: Group firewall
+  ansible.builtin.import_tasks: firewall.yml
+  when: harden_firewall | bool
+  tags: [firewall]
+
+- name: Group fail2ban
+  ansible.builtin.import_tasks: fail2ban.yml
+  when: harden_fail2ban | bool
+  tags: [fail2ban]
+
+- name: Group sysctl
+  ansible.builtin.import_tasks: sysctl.yml
+  when: harden_sysctl | bool
+  tags: [sysctl]
+
+- name: Group modules
+  ansible.builtin.import_tasks: modules.yml
+  when: harden_modules | bool
+  tags: [modules]
+
+- name: Group auditd
+  ansible.builtin.import_tasks: auditd.yml
+  when: harden_auditd | bool
+  tags: [auditd]
+
+- name: Group accounts
+  ansible.builtin.import_tasks: accounts.yml
+  when: harden_accounts | bool
+  tags: [accounts]
+
+- name: Group fileperms
+  ansible.builtin.import_tasks: fileperms.yml
+  when: harden_fileperms | bool
+  tags: [fileperms]
+
+- name: Group services
+  ansible.builtin.import_tasks: services.yml
+  when: harden_services | bool
+  tags: [services]
+
+- name: Group mac
+  ansible.builtin.import_tasks: mac.yml
+  when: harden_mac | bool
+  tags: [mac]
+
+- name: Group logging
+  ansible.builtin.import_tasks: logging.yml
+  when: harden_logging | bool
+  tags: [logging]
+
+- name: Group banner
+  ansible.builtin.import_tasks: banner.yml
+  when: harden_banner | bool
+  tags: [banner]
+
+- name: Summary
+  ansible.builtin.import_tasks: summary.yml
+  tags: [always]

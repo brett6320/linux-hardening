@@ -1,0 +1,350 @@
+---
+# Control group: firewall (SPEC "firewall", safety rules 2, 3, 4).
+- name: Firewall | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: firewall
+
+- name: Firewall | probe ufw
+  ansible.builtin.command:
+    argv: [ufw, status]
+  register: harden_fw_ufw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Firewall | skip when ufw is active
+  ansible.builtin.set_fact:
+    harden_grp_skip: ufw is active (not fighting it)
+  when: harden_fw_ufw.rc | default(1) == 0 and (harden_fw_ufw.stdout | default('')) is search('Status:\s+active')
+
+- name: Firewall | warn when ufw is active
+  ansible.builtin.include_tasks: _warn.yml
+  vars:
+    harden_warn_msg: ufw is active; firewall group skipped.
+  when: harden_grp_skip | length > 0
+
+- name: Firewall | skip when the firewall backend is not installed
+  ansible.builtin.set_fact:
+    harden_grp_skip: "{{ harden_firewall_backend }} is not installed (packages group disabled or failed)"
+  when: harden_grp_skip | length == 0 and harden_firewall_backend not in ansible_facts['packages']
+
+- name: Firewall | read default routes
+  ansible.builtin.command:
+    argv: "{{ ['ip'] + item + ['route', 'show', 'default'] }}"
+  loop: [[], ['-6']]
+  register: harden_fw_routes
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: harden_grp_skip | length == 0
+
+- name: Firewall | select default-route interfaces
+  ansible.builtin.set_fact:
+    harden_fw_ifaces: >-
+      {{ harden_fw_routes.results | default([]) | map(attribute='stdout') | map('default', '') | join(' ')
+         | regex_findall('dev (\S+)') | unique
+         | reject('match', '^(docker|cni|veth|wg|tailscale|virbr)') | list }}
+  when: harden_grp_skip | length == 0
+
+# ---------------------------------------------------------------- nftables
+- name: Firewall | nftables backend (debian)
+  when: harden_grp_skip | length == 0 and harden_firewall_backend == 'nftables'
+  block:
+    - name: Firewall | render nftables rules
+      ansible.builtin.set_fact:
+        harden_nft_content: "{{ lookup('ansible.builtin.template', 'nftables_hardening.nft.j2') }}"
+        harden_nft_file: /etc/nftables.d/hardening.nft
+
+    - name: Firewall | stat /etc/nftables.d
+      ansible.builtin.stat:
+        path: /etc/nftables.d
+      register: harden_nft_dir
+
+    - name: Firewall | predict rules file change
+      ansible.builtin.copy:
+        dest: "{{ harden_nft_file }}"
+        content: "{{ harden_nft_content }}"
+        owner: root
+        group: root
+        mode: "0644"
+      check_mode: true
+      register: harden_nft_pred_file
+      when: harden_nft_dir.stat.exists
+
+    - name: Firewall | predict include line in /etc/nftables.conf
+      ansible.builtin.lineinfile:
+        path: /etc/nftables.conf
+        line: include "/etc/nftables.d/*.nft"
+        create: true
+        mode: "0755"
+      check_mode: true
+      register: harden_nft_pred_inc
+
+    - name: Firewall | probe loaded hardening table
+      ansible.builtin.command:
+        argv: [nft, list, table, inet, hardening]
+      register: harden_nft_loaded
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Firewall | probe nftables service
+      ansible.builtin.command:
+        argv: [systemctl, show, -p, UnitFileState, -p, ActiveState, nftables.service]
+      register: harden_nft_unit
+      changed_when: false
+      check_mode: false
+
+    - name: Firewall | evaluate nftables state
+      ansible.builtin.set_fact:
+        harden_nft_unit_state: >-
+          {{ dict(harden_nft_unit.stdout_lines | map('split', '=') | map('list') | list) }}
+        harden_nft_change_file: "{{ not harden_nft_dir.stat.exists or harden_nft_pred_file is changed }}"
+        harden_nft_change_inc: "{{ harden_nft_pred_inc is changed }}"
+
+    - name: Firewall | evaluate nftables pending work
+      ansible.builtin.set_fact:
+        harden_fw_pending: >-
+          {{ harden_nft_change_file or harden_nft_change_inc or harden_nft_loaded.rc != 0
+             or harden_nft_unit_state['UnitFileState'] | default('') != 'enabled' }}
+
+# ---------------------------------------------------------------- firewalld
+- name: Firewall | firewalld backend (rhel/suse)
+  when: harden_grp_skip | length == 0 and harden_firewall_backend == 'firewalld'
+  block:
+    - name: Firewall | warn when no default-route interface was found
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: >-
+          No default-route interface found; the firewalld drop zone is configured but bound to no
+          interface (the default zone is left unchanged).
+      when: harden_fw_ifaces | length == 0
+
+    - name: Firewall | probe firewalld service
+      ansible.builtin.command:
+        argv: [systemctl, show, -p, UnitFileState, -p, ActiveState, firewalld.service]
+      register: harden_fwd_unit
+      changed_when: false
+      check_mode: false
+
+    - name: Firewall | evaluate firewalld service state
+      ansible.builtin.set_fact:
+        harden_fwd_unit_state: >-
+          {{ dict(harden_fwd_unit.stdout_lines | map('split', '=') | map('list') | list) }}
+        harden_fwd_pending: true
+        harden_fwd_old_zones: {}
+
+    - name: Firewall | compare firewalld configuration
+      ansible.builtin.include_tasks: _firewalld_probe.yml
+      when: harden_fwd_unit_state['ActiveState'] | default('') == 'active'
+
+    - name: Firewall | evaluate firewalld pending work
+      ansible.builtin.set_fact:
+        harden_fwd_was_active: "{{ harden_fwd_unit_state['ActiveState'] | default('') == 'active' }}"
+        harden_fw_pending: >-
+          {{ harden_fwd_unit_state['ActiveState'] | default('') != 'active'
+             or harden_fwd_unit_state['UnitFileState'] | default('') != 'enabled'
+             or harden_fwd_pending | bool }}
+
+# ---------------------------------------------------------------- apply
+- name: Firewall | check listening sockets before enabling (safety rule 2)
+  ansible.builtin.include_tasks: _fw_listen_check.yml
+  when: harden_grp_skip | length == 0 and harden_fw_pending | default(false) | bool
+
+- name: Firewall | report predicted change in check mode
+  ansible.builtin.set_fact:
+    harden_grp_changed: true
+  when: ansible_check_mode and harden_grp_skip | length == 0 and harden_fw_pending | default(false) | bool
+
+- name: Firewall | apply nftables with auto-rollback
+  when:
+    - not ansible_check_mode
+    - harden_grp_skip | length == 0
+    - harden_firewall_backend == 'nftables'
+    - harden_fw_pending | default(false) | bool
+  block:
+    - name: Firewall | back up nftables rules file
+      ansible.builtin.include_tasks: _backup.yml
+      vars:
+        harden_bk_path: "{{ harden_nft_file }}"
+
+    - name: Firewall | back up /etc/nftables.conf
+      ansible.builtin.include_tasks: _backup.yml
+      vars:
+        harden_bk_path: /etc/nftables.conf
+
+    - name: Firewall | record nftables service state
+      ansible.builtin.include_tasks: _unit_record.yml
+      vars:
+        harden_unit_name: nftables.service
+        harden_unit_enabled: "{{ harden_nft_unit_state['UnitFileState'] | default('') }}"
+        harden_unit_active: "{{ harden_nft_unit_state['ActiveState'] | default('') }}"
+
+    - name: Firewall | schedule auto-rollback
+      ansible.builtin.include_tasks: _rollback_schedule.yml
+      vars:
+        harden_rb_reload: |-
+          if [ -f {{ harden_nft_file }} ]; then nft -f {{ harden_nft_file }}; else nft delete table inet hardening 2>/dev/null || true; fi
+          {{ '' if harden_nft_unit_state['UnitFileState'] | default('') == 'enabled' else 'systemctl disable nftables.service || true' }}
+
+    - name: Firewall | apply nftables rules, reconnect
+      block:
+        - name: Firewall | write nftables rules file
+          ansible.builtin.include_tasks: _file.yml
+          vars:
+            harden_f:
+              path: "{{ harden_nft_file }}"
+              content: "{{ harden_nft_content }}"
+              mode: "0644"
+              validate: nft -c -f %s
+
+        - name: Firewall | include /etc/nftables.d in /etc/nftables.conf
+          ansible.builtin.include_tasks: _line.yml
+          vars:
+            harden_l:
+              path: /etc/nftables.conf
+              line: include "/etc/nftables.d/*.nft"
+              create: true
+              mode: "0755"
+
+        - name: Firewall | load hardening table (other tables untouched)
+          ansible.builtin.command:
+            argv: [nft, -f, "{{ harden_nft_file }}"]
+          changed_when: true
+
+        - name: Firewall | enable nftables at boot (not started, it would flush the ruleset)
+          ansible.builtin.systemd_service:
+            name: nftables.service
+            enabled: true
+          register: harden_nft_enable
+
+        - name: Firewall | confirm connectivity with a new connection
+          ansible.builtin.include_tasks: _reconnect.yml
+
+        - name: Firewall | cancel auto-rollback
+          ansible.builtin.include_tasks: _rollback_cancel.yml
+
+        - name: Firewall | track change
+          ansible.builtin.set_fact:
+            harden_grp_changed: true
+      rescue:
+        - name: Firewall | restore nftables immediately
+          ansible.builtin.command:
+            argv: [/bin/sh, "{{ harden_backup_dir }}/rollback-firewall.sh"]
+          changed_when: true
+          failed_when: false
+
+        - name: Firewall | cancel rollback timer after manual restore
+          ansible.builtin.include_tasks: _rollback_cancel.yml
+          vars:
+            harden_rb_strict: false
+
+        - name: Firewall | abort group
+          ansible.builtin.set_fact:
+            harden_grp_failed: >-
+              {{ ansible_failed_task.name | default('firewall change') }} failed, backup restored:
+              {{ (ansible_failed_result.stderr | default('') or ansible_failed_result.msg | default('')) | trim }}
+
+- name: Firewall | apply firewalld with auto-rollback
+  when:
+    - not ansible_check_mode
+    - harden_grp_skip | length == 0
+    - harden_firewall_backend == 'firewalld'
+    - harden_fw_pending | default(false) | bool
+  block:
+    - name: Firewall | list firewalld zone files
+      ansible.builtin.find:
+        paths: /etc/firewalld/zones
+        patterns: "*.xml"
+      register: harden_fwd_zonefiles
+
+    - name: Firewall | back up firewalld configuration
+      ansible.builtin.include_tasks: _backup.yml
+      vars:
+        harden_bk_path: "{{ harden_fwd_bk_item }}"
+      loop: >-
+        {{ (['/etc/firewalld/firewalld.conf', '/etc/firewalld/zones/drop.xml']
+            + (harden_fwd_zonefiles.files | map(attribute='path') | list)) | unique }}
+      loop_control:
+        loop_var: harden_fwd_bk_item
+
+    - name: Firewall | record firewalld service state
+      ansible.builtin.include_tasks: _unit_record.yml
+      vars:
+        harden_unit_name: firewalld.service
+        harden_unit_enabled: "{{ harden_fwd_unit_state['UnitFileState'] | default('') }}"
+        harden_unit_active: "{{ harden_fwd_unit_state['ActiveState'] | default('') }}"
+
+    - name: Firewall | schedule auto-rollback
+      ansible.builtin.include_tasks: _rollback_schedule.yml
+      vars:
+        harden_rb_reload: |-
+          {% if harden_fwd_was_active | bool %}
+          firewall-cmd --reload
+          {% for i, z in harden_fwd_old_zones.items() %}
+          firewall-cmd --zone={{ z }} --change-interface={{ i }}
+          firewall-cmd --permanent --zone={{ z }} --change-interface={{ i }}
+          {% endfor %}
+          {% else %}
+          systemctl disable --now firewalld.service
+          {% endif %}
+
+    - name: Firewall | apply firewalld settings, reconnect
+      block:
+        - name: Firewall | enable and start firewalld
+          ansible.builtin.systemd_service:
+            name: firewalld.service
+            enabled: true
+            state: started
+
+        - name: Firewall | compare firewalld configuration (running)
+          ansible.builtin.include_tasks: _firewalld_probe.yml
+
+        - name: Firewall | apply permanent drop zone settings
+          ansible.builtin.command:
+            argv: "{{ item }}"
+          loop: "{{ harden_fwd_perm_cmds }}"
+          changed_when: true
+
+        - name: Firewall | reload firewalld
+          ansible.builtin.command:
+            argv: [firewall-cmd, --reload]
+          changed_when: true
+          when: harden_fwd_perm_cmds | length > 0
+
+        - name: Firewall | move default-route interfaces into drop (runtime)
+          ansible.builtin.command:
+            argv: "{{ item }}"
+          loop: "{{ harden_fwd_if_cmds }}"
+          changed_when: true
+
+        - name: Firewall | confirm connectivity with a new connection
+          ansible.builtin.include_tasks: _reconnect.yml
+
+        - name: Firewall | cancel auto-rollback
+          ansible.builtin.include_tasks: _rollback_cancel.yml
+
+        - name: Firewall | track change
+          ansible.builtin.set_fact:
+            harden_grp_changed: true
+      rescue:
+        - name: Firewall | restore firewalld immediately
+          ansible.builtin.command:
+            argv: [/bin/sh, "{{ harden_backup_dir }}/rollback-firewall.sh"]
+          changed_when: true
+          failed_when: false
+
+        - name: Firewall | cancel rollback timer after manual restore
+          ansible.builtin.include_tasks: _rollback_cancel.yml
+          vars:
+            harden_rb_strict: false
+
+        - name: Firewall | abort group
+          ansible.builtin.set_fact:
+            harden_grp_failed: >-
+              {{ ansible_failed_task.name | default('firewall change') }} failed, backup restored:
+              {{ (ansible_failed_result.stderr | default('') or ansible_failed_result.msg | default('')) | trim }}
+
+- name: Firewall | record group result
+  ansible.builtin.include_tasks: _record.yml
