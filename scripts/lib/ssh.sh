@@ -109,6 +109,20 @@ ssh_user_has_keys() {
 
 _in_words() { local x=$1 w; for w in $2; do [[ ${w%%@*} == "$x" ]] && return 0; done; return 1; }
 
+# _allow_users_permits USER CLIENT_IP -> 0 if an AllowUsers entry admits USER
+# from CLIENT_IP. user@host entries only count when host is an address/CIDR
+# containing the client; patterns or an unknown client fail closed.
+_allow_users_permits() {
+  local u=$1 client=$2 w host
+  for w in $HARDEN_SSH_ALLOW_USERS; do
+    [[ ${w%%@*} == "$u" ]] || continue
+    [[ $w == *@* ]] || return 0
+    host=${w#*@}
+    [[ -n $client && $host =~ ^[0-9A-Fa-f.:]+(/[0-9]+)?$ ]] && ip_in_cidr "$client" "$host" && return 0
+  done
+  return 1
+}
+
 # Decide key-only / root login policy (safety rule 1). Needs SSHD_T loaded.
 ssh_compute_policy() {
   local u ent uid home shell akc have_akc=false
@@ -241,6 +255,12 @@ ssh_unattended_refusal() { # old_ports
   fi
   if [[ -n $HARDEN_SSH_ALLOW_USERS ]] && ! _in_words "$u" "$HARDEN_SSH_ALLOW_USERS"; then
     echo "you ($u) are not in HARDEN_SSH_ALLOW_USERS"; return 0
+  fi
+  if [[ -n $HARDEN_SSH_ALLOW_USERS ]]; then
+    lh_ssh_session
+    if ! _allow_users_permits "$u" "$LH_SSH_CLIENT"; then
+      echo "HARDEN_SSH_ALLOW_USERS doesn't admit $u from ${LH_SSH_CLIENT:-an unknown client address}"; return 0
+    fi
   fi
   if $SSH_KEY_ONLY && ! _ssh_key_capable "$u"; then
     echo "password authentication would be disabled and you ($u) have no authorized keys"; return 0

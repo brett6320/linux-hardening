@@ -717,10 +717,13 @@ lh_ssh_session() {
   if [[ -n ${SSH_CONNECTION:-} ]]; then LH_SSH_CLIENT=${SSH_CONNECTION%% *}; fi
   while [[ $pid =~ ^[0-9]+$ ]] && (( pid > 1 && n++ < 64 )); do
     conn=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^SSH_CONNECTION=//p' | head -n1 || true)
+    # Nearest ancestor wins: a tmux/screen server further up keeps the
+    # SSH_CONNECTION of whichever session first started it.
     if [[ -n $conn ]]; then
       LH_SSH_CLIENT=${conn%% *}
       uid=$(awk '$1 == "Uid:" { print $2 }' "/proc/$pid/status" 2>/dev/null || true)
       [[ -n $uid ]] && LH_SSH_USER=$(getent passwd "$uid" | cut -d: -f1 || true)
+      break
     fi
     pid=$(awk '$1 == "PPid:" { print $2 }' "/proc/$pid/status" 2>/dev/null || true)
   done
