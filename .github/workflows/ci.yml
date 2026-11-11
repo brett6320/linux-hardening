@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x -S style scripts/harden.sh scripts/lib/*.sh tests/container/run.sh tests/container/txn.sh
+
+  container:
+    needs: lint
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [shell]
+        image:
+          - debian:12
+          - debian:13
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - rockylinux/rockylinux:9
+          - almalinux:10
+          - quay.io/centos/centos:stream9
+          - fedora:42
+          - opensuse/leap:15.6
+          - opensuse/leap:16.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Harden, re-run for idempotence, audit
+        run: tests/container/run.sh "${{ matrix.image }}" "${{ matrix.mode }}"
+
+  rollback-transaction:
+    needs: lint
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian:12, ubuntu:24.04]  # txn.sh drives ssh.service + nftables (debian family)
+    steps:
+      - uses: actions/checkout@v4
+      - name: SSH/firewall rollback transaction self-test
+        run: tests/container/txn.sh "${{ matrix.image }}"

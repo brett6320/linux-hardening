@@ -1,0 +1,89 @@
+# linux-hardening configuration (shell implementation).
+#
+# Copy to /etc/linux-hardening.conf (root-owned, not group/world-writable) or
+# pass with --config FILE. Precedence: /etc/linux-hardening.conf < --config
+# FILE < environment. Format: KEY=value shell assignments; lists are
+# space-separated strings. Every value below is the default.
+#
+# Installed layout: cp -a <repo> /opt/linux-hardening, then run
+#   /opt/linux-hardening/scripts/harden.sh --check
+# The data/ lists are read at runtime from ../data next to the script, or
+# /opt/linux-hardening/data (override: LH_DATA_DIR=/path).
+
+# --- ssh ---------------------------------------------------------------------
+# sshd port (also opened in the firewall; SELinux label added when != 22).
+HARDEN_SSH_PORT=22
+# Space-separated user names for AllowUsers; empty = no AllowUsers line.
+# Every name must exist or the ssh group aborts.
+HARDEN_SSH_ALLOW_USERS=""
+# Disable password/keyboard-interactive auth even when no key-capable
+# sudo/wheel user is found (risk of lockout).
+HARDEN_FORCE_KEY_ONLY=false
+
+# --- firewall ----------------------------------------------------------------
+# CIDRs allowed to reach SSH; empty = SSH open to all. Also added to fail2ban ignoreip.
+HARDEN_ADMIN_SOURCES=""
+# Extra inbound TCP/UDP ports (N or N-M), in addition to SSH.
+HARDEN_ALLOWED_TCP_PORTS=""
+HARDEN_ALLOWED_UDP_PORTS=""
+# Enable the firewall even if non-allowlisted ports are listening (they get blocked).
+HARDEN_FIREWALL_FORCE=false
+# Listeners the precheck ignores (proto/port) because blocking them is the point:
+# mDNS and LLMNR (systemd-resolved listens on 5355 by default on Fedora).
+HARDEN_FIREWALL_IGNORE_LISTENERS="udp/5353 tcp/5355 udp/5355"
+# Seconds before SSH/firewall changes are rolled back unless confirmed (>= 30).
+HARDEN_ROLLBACK_SECONDS=120
+# With --yes, refuse (abort the group) when the SSH port changes, your SSH client
+# address is outside HARDEN_ADMIN_SOURCES, or you (SUDO_USER / SSH session owner)
+# are not in HARDEN_SSH_ALLOW_USERS or would lose password auth without keys.
+# true = apply anyway (the --yes check is local-only and can't prove you can log in).
+HARDEN_UNATTENDED_FORCE=false
+
+# --- sysctl ------------------------------------------------------------------
+# net.ipv6.conf.{all,default}.disable_ipv6 = 1
+HARDEN_DISABLE_IPV6=false
+# net.ipv6.conf.{all,default}.accept_ra = 0 (breaks SLAAC / cloud IPv6)
+HARDEN_IPV6_ACCEPT_RA_OFF=false
+# kernel.kexec_load_disabled = 1 (breaks kdump)
+HARDEN_KEXEC_DISABLE=false
+
+# --- packages / updates ------------------------------------------------------
+# Apply all pending updates during the run.
+HARDEN_APPLY_UPDATES=true
+# Let automatic security updates reboot the host when required.
+HARDEN_AUTO_REBOOT=false
+# Reboot time (HH:MM) for debian (unattended-upgrades) and suse (reboot timer).
+HARDEN_AUTO_REBOOT_TIME=04:00
+
+# --- fail2ban ----------------------------------------------------------------
+HARDEN_FAIL2BAN_BANTIME=1h
+HARDEN_FAIL2BAN_MAXRETRY=5
+# Extra ignoreip entries (127.0.0.1/8 ::1 and HARDEN_ADMIN_SOURCES are always included).
+HARDEN_FAIL2BAN_IGNOREIP=""
+
+# --- auditd ------------------------------------------------------------------
+# Append "-e 2" (rules immutable until reboot).
+HARDEN_AUDIT_IMMUTABLE=false
+# Comment out "-a task,never" in other rules.d files (Fedora default) so
+# syscall rules take effect.
+HARDEN_AUDIT_FIX_TASK_NEVER=false
+
+# --- mac ---------------------------------------------------------------------
+# Switch SELinux from permissive to enforcing despite AVC denials today.
+HARDEN_SELINUX_FORCE=false
+
+# --- group toggles (false = skip the group) ---------------------------------
+HARDEN_PACKAGES=true
+HARDEN_UPDATES=true
+HARDEN_SSH=true
+HARDEN_FIREWALL=true
+HARDEN_FAIL2BAN=true
+HARDEN_SYSCTL=true
+HARDEN_MODULES=true
+HARDEN_AUDITD=true
+HARDEN_ACCOUNTS=true
+HARDEN_FILEPERMS=true
+HARDEN_SERVICES=true
+HARDEN_MAC=true
+HARDEN_LOGGING=true
+HARDEN_BANNER=true

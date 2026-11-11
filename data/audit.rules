@@ -1,0 +1,44 @@
+## linux-hardening audit rules
+## Lines containing ARCH are emitted for b64 and, on x86_64, also for b32.
+
+# Identity
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/security/opasswd -p wa -k identity
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+
+# SSH config
+-w /etc/ssh/sshd_config -p wa -k sshd
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd
+
+# Time
+-a always,exit -F arch=ARCH -S adjtimex,settimeofday,clock_settime -k time-change
+-w /etc/localtime -p wa -k time-change
+
+# Network identity
+-a always,exit -F arch=ARCH -S sethostname,setdomainname -k system-locale
+-w /etc/hosts -p wa -k system-locale
+-w /etc/hostname -p wa -k system-locale
+
+# Logins
+-w /var/log/lastlog -p wa -k logins
+-w /var/run/faillock/ -p wa -k logins
+
+# Kernel modules
+-a always,exit -F arch=ARCH -S init_module,finit_module,delete_module -k modules
+-w /usr/bin/kmod -p x -k modules
+
+# Privilege escalation: commands run as root by a real logged-in user
+-a always,exit -F arch=ARCH -S execve -F euid=0 -F auid>=1000 -F auid!=4294967295 -k privileged-exec
+
+# Scheduled jobs
+-w /etc/crontab -p wa -k cron
+-w /etc/cron.d/ -p wa -k cron
+-w /etc/cron.daily/ -p wa -k cron
+-w /etc/cron.hourly/ -p wa -k cron
+-w /etc/cron.weekly/ -p wa -k cron
+-w /etc/cron.monthly/ -p wa -k cron
+-w /var/spool/cron/ -p wa -k cron

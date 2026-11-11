@@ -1,0 +1,27 @@
+# family:package — removed if installed.
+debian:telnet
+debian:rsh-client
+debian:rsh-server
+debian:talk
+debian:talkd
+debian:nis
+debian:xinetd
+debian:tftpd
+debian:tftpd-hpa
+rhel:telnet
+rhel:telnet-server
+rhel:rsh
+rhel:rsh-server
+rhel:talk
+rhel:talk-server
+rhel:ypbind
+rhel:ypserv
+rhel:xinetd
+rhel:tftp-server
+suse:telnet
+suse:telnet-server
+suse:rsh
+suse:rsh-server
+suse:ypbind
+suse:xinetd
+suse:tftp
