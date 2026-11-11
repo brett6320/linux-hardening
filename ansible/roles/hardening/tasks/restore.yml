@@ -22,6 +22,15 @@
     src: "{{ harden_backup_dir }}/manifest"
   register: harden_rs_manifest
 
+- name: Restore | refuse backups written by harden.sh (different manifest format)
+  ansible.builtin.assert:
+    that:
+      - not ((harden_rs_manifest.content | b64decode).startswith('# linux-hardening backup '))
+    fail_msg: >-
+      {{ harden_backup_dir }} was created by scripts/harden.sh; restore it with
+      "harden.sh --restore {{ harden_restore_timestamp }}".
+    quiet: true
+
 - name: Restore | parse manifest (newest entry first)
   ansible.builtin.set_fact:
     harden_rs_entries: >-
