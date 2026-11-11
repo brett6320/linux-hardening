@@ -239,6 +239,10 @@ do_list_backups() {
   [[ -d $LH_BACKUP_ROOT ]] || { echo "no backups in $LH_BACKUP_ROOT"; return 0; }
   for d in "$LH_BACKUP_ROOT"/*/; do
     [[ -f $d/manifest ]] || continue
+    if ! head -n1 "$d/manifest" | grep -q '^# linux-hardening backup '; then
+      printf '%s  (Ansible backup: restore with ansible/restore.yml)\n' "$(basename "$d")"
+      continue
+    fi
     n=$(grep -cv '^#' "$d/manifest" || true)
     printf '%s  (%s entries; groups: %s)\n' "$(basename "$d")" "$n" \
       "$(awk '!/^#/ && $1!="note" {print $2}' "$d/manifest" | sort -u | paste -sd, -)"
@@ -250,6 +254,9 @@ do_restore() {
   [[ $ts =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || die "invalid timestamp: $ts"
   dir="$LH_BACKUP_ROOT/$ts"
   [[ -f $dir/manifest ]] || die "no backup manifest at $dir"
+  # The Ansible role writes a different manifest format to the same root.
+  head -n1 "$dir/manifest" | grep -q '^# linux-hardening backup ' \
+    || die "$dir was not created by harden.sh (Ansible backup?): restore it with ansible/restore.yml"
   groups=$(awk '!/^#/ && $1!="note" {print $2}' "$dir/manifest" | sort -u)
   script=$(
     echo 'set -u'
