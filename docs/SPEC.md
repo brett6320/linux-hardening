@@ -62,6 +62,9 @@ Detection: `/etc/os-release` `ID` then `ID_LIKE`. Unknown → abort.
    `/var/backups/linux-hardening/<timestamp>/<original path>` with a
    `manifest` listing created (vs modified) files. `--restore <timestamp>`
    reverts (delete created, restore modified, reload affected services).
+   The two implementations keep different manifest formats (the shell one
+   starts with `# linux-hardening backup`); each refuses to restore the
+   other's backups and points to the right tool.
 5. Drop-ins over editing vendor files. sshd: `/etc/ssh/sshd_config.d/00-hardening.conf`
    (sshd is first-match-wins, so it must sort **before** `50-cloud-init.conf`
    / `50-redhat.conf`). modprobe: `00-hardening.conf` (first `install`
