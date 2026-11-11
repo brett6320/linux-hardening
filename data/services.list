@@ -1,0 +1,31 @@
+# Units disabled + masked only when present and NOT active.
+# Active units are reported, never stopped.
+avahi-daemon.service
+avahi-daemon.socket
+cups.service
+cups.socket
+cups-browsed.service
+rpcbind.service
+rpcbind.socket
+nfs-server.service
+smb.service
+smbd.service
+nmb.service
+nmbd.service
+vsftpd.service
+telnet.socket
+rsh.socket
+rlogin.socket
+rexec.socket
+tftp.socket
+tftp.service
+xinetd.service
+snmpd.service
+squid.service
+dovecot.service
+bluetooth.service
+isc-dhcp-server.service
+dhcpd.service
+slapd.service
+named.service
+bind9.service
