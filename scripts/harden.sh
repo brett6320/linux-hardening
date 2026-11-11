@@ -116,7 +116,7 @@ _in_list() { local x=$1; shift; local y; for y in "$@"; do [[ $x == "$y" ]] && r
 # Group execution: each group runs in a subshell so a failure aborts only that
 # group. Results come back through $LH_RESULTS.
 # ---------------------------------------------------------------------------
-# shellcheck disable=SC2329  # invoked from the EXIT trap in run_group
+# shellcheck disable=SC2317,SC2329  # invoked from the EXIT trap in run_group
 _group_exit_trap() {
   local rc=$1
   if (( rc != 0 && rc != 3 )); then
