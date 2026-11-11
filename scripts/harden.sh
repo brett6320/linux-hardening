@@ -284,7 +284,7 @@ _txn_groups() {
 # --confirm: cancel all pending rollbacks, unless one of the transaction has
 # already fired; then roll back the rest too (never confirm half of it).
 do_confirm() {
-  local g sess pending=() fired=() confirmed=()
+  local g sess pending=() fired=() confirmed=() vanished=()
   sess=$(cat "$LH_MARK_DIR/session" 2>/dev/null || true)
   if [[ -n $sess && $sess == "${SSH_CONNECTION:-}" ]]; then
     log_warn "this looks like the same SSH session that ran the hardening; a NEW session proves more"
@@ -299,18 +299,27 @@ do_confirm() {
       confirmed+=("$g")
     else
       fired+=("$g")  # timer gone without a marker: fail closed
+      vanished+=("$g")
     fi
   done
   if (( ${#fired[@]} )); then
     for g in "${fired[@]}"; do
-      echo "TOO LATE: $(rollback_unit "$g").timer already fired; $g changes were (or are being) rolled back" >&2
+      if [[ " ${vanished[*]} " == *" $g "* ]]; then
+        echo "UNKNOWN: $(rollback_unit "$g").timer is gone without a rollback marker (reboot?); $g changes may still be in place: check them, or use --restore" >&2
+      else
+        echo "TOO LATE: $(rollback_unit "$g").timer already fired; $g changes were (or are being) rolled back" >&2
+      fi
     done
     for g in "${pending[@]}"; do
       echo "rolling back $g now as well: SSH and firewall changes are confirmed or rolled back together" >&2
       rollback_now "$g"
     done
     lh_txn_unlock
-    echo "nothing was confirmed; this run's SSH/firewall changes are rolled back. Fix the cause and re-run harden.sh." >&2
+    if (( ${#vanished[@]} == ${#fired[@]} )); then
+      echo "nothing was confirmed; pending groups were rolled back, but ${vanished[*]} could not be verified. Check, then re-run harden.sh." >&2
+    else
+      echo "nothing was confirmed; this run's SSH/firewall changes are rolled back. Fix the cause and re-run harden.sh." >&2
+    fi
     exit 1
   fi
   for g in "${pending[@]}"; do
