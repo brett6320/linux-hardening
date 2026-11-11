@@ -33,6 +33,11 @@ HARDEN_FIREWALL_FORCE=false
 HARDEN_FIREWALL_IGNORE_LISTENERS="udp/5353 tcp/5355 udp/5355"
 # Seconds before SSH/firewall changes are rolled back unless confirmed (>= 30).
 HARDEN_ROLLBACK_SECONDS=120
+# With --yes, refuse (abort the group) when the SSH port changes, your SSH client
+# address is outside HARDEN_ADMIN_SOURCES, or you (SUDO_USER / SSH session owner)
+# are not in HARDEN_SSH_ALLOW_USERS or would lose password auth without keys.
+# true = apply anyway (the --yes check is local-only and can't prove you can log in).
+HARDEN_UNATTENDED_FORCE=false
 
 # --- sysctl ------------------------------------------------------------------
 # net.ipv6.conf.{all,default}.disable_ipv6 = 1

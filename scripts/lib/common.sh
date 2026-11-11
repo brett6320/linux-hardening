@@ -120,6 +120,7 @@ lh_apply_defaults() {
   : "${HARDEN_FIREWALL_FORCE:=false}"
   : "${HARDEN_FIREWALL_IGNORE_LISTENERS=udp/5353 tcp/5355 udp/5355}"
   : "${HARDEN_ROLLBACK_SECONDS:=120}"
+  : "${HARDEN_UNATTENDED_FORCE:=false}"
   : "${HARDEN_DISABLE_IPV6:=false}"
   : "${HARDEN_IPV6_ACCEPT_RA_OFF:=false}"
   : "${HARDEN_KEXEC_DISABLE:=false}"
@@ -200,7 +201,7 @@ lh_validate_config() {
     [[ $v =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*\$?(@[A-Za-z0-9.:/*?-]+)?$ ]] || die "invalid user in HARDEN_SSH_ALLOW_USERS: $v"
   done
   for b in FORCE_KEY_ONLY FIREWALL_FORCE DISABLE_IPV6 IPV6_ACCEPT_RA_OFF KEXEC_DISABLE APPLY_UPDATES \
-           AUTO_REBOOT AUDIT_IMMUTABLE AUDIT_FIX_TASK_NEVER SELINUX_FORCE; do
+           AUTO_REBOOT AUDIT_IMMUTABLE AUDIT_FIX_TASK_NEVER SELINUX_FORCE UNATTENDED_FORCE; do
     v="HARDEN_$b"
     _lh_norm_bool "$v"
   done
@@ -573,7 +574,14 @@ lh_render_reload_cmds() {
 # ---------------------------------------------------------------------------
 rollback_unit() { printf 'hardening-rollback-%s' "$1"; }
 
+# SSH and firewall rollbacks form one transaction: $LH_MARK_DIR/txn lists the
+# groups scheduled in the current run. If any of them rolls back (timer fired
+# or verification failed), all of them roll back; they are cancelled only
+# together. Markers: rolledback-<g> (written as the rollback starts),
+# confirmed-<g>. rollback.lock serialises rollback scripts and --confirm.
+
 # Write the rollback script for <grp> from this run's manifest.
+# shellcheck disable=SC2016  # single-quoted lines are code for the generated script
 _rollback_write_script() {
   local grp=$1 f="$LH_STATE_DIR/rollback-$1.sh"
   mkdir -p "$LH_STATE_DIR"
@@ -582,14 +590,37 @@ _rollback_write_script() {
     echo '#!/bin/bash'
     echo "# linux-hardening auto-rollback for group '$grp' (backup $LH_TS)"
     echo 'set -u'
+    printf 'M=%q\nS=%q\n' "$LH_MARK_DIR" "$LH_STATE_DIR"
+    echo 'mkdir -p "$M"'
+    echo 'if [ -z "${LH_ROLLBACK_LOCKED:-}" ]; then exec 8>"$M/rollback.lock"; flock 8; export LH_ROLLBACK_LOCKED=1; fi'
+    echo "if [ -e \"\$M/rolledback-$grp\" ]; then echo 'linux-hardening: $grp already rolled back'; exit 0; fi"
+    echo "if [ -e \"\$M/confirmed-$grp\" ] && [ -z \"\${LH_ROLLBACK_FORCE:-}\" ]; then echo 'linux-hardening: $grp was confirmed; not rolling back'; exit 0; fi"
+    echo "touch \"\$M/rolledback-$grp\""
     echo "echo 'linux-hardening: rolling back $grp changes from $LH_TS'"
     lh_render_restore_cmds "$LH_BACKUP_DIR" "$grp"
     lh_render_reload_cmds "$grp" "$LH_BACKUP_DIR"
-    echo "mkdir -p $LH_MARK_DIR && touch $LH_MARK_DIR/rolledback-$grp"
+    echo '# Roll back the rest of the transaction too.'
+    echo 'for o in $(cat "$M/txn" 2>/dev/null); do'
+    echo "  [ \"\$o\" = $grp ] && continue"
+    echo '  [ -e "$M/rolledback-$o" ] && continue'
+    echo '  [ -f "$S/rollback-$o.sh" ] || continue'
+    echo "  echo \"linux-hardening: also rolling back \$o (rolled back together with $grp)\""
+    echo '  systemctl stop "hardening-rollback-$o.timer" >/dev/null 2>&1 || true'
+    echo '  LH_ROLLBACK_FORCE=1 bash "$S/rollback-$o.sh"'
+    echo 'done'
   } >"$f"
   chmod 0700 "$f"
   printf '%s' "$f"
 }
+
+# Hold rollback.lock (fd 8) while deciding/cancelling; scripts run meanwhile skip locking.
+lh_txn_lock() {
+  mkdir -p "$LH_MARK_DIR"
+  exec 8>"$LH_MARK_DIR/rollback.lock"
+  flock 8
+  export LH_ROLLBACK_LOCKED=1
+}
+lh_txn_unlock() { unset LH_ROLLBACK_LOCKED; exec 8>&-; }
 
 # Schedule rollback of <grp> in HARDEN_ROLLBACK_SECONDS. Call immediately
 # before activating the change (reload sshd / load firewall rules).
@@ -605,12 +636,23 @@ schedule_rollback() {
   systemctl stop "$unit.timer" >/dev/null 2>&1 || true
   systemctl reset-failed "$unit.service" "$unit.timer" >/dev/null 2>&1 || true
   mkdir -p "$LH_MARK_DIR"
+  if [[ ! -e $LH_RUN_DIR/txn_started ]]; then
+    # First rollback of this run: start a new transaction (no rollback can be
+    # pending here; main refuses to run while one is).
+    rm -f "$LH_MARK_DIR"/rolledback-* "$LH_MARK_DIR"/confirmed-* "$LH_MARK_DIR/txn"
+    touch "$LH_RUN_DIR/txn_started"
+  fi
   rm -f "$LH_MARK_DIR/rolledback-$grp" "$LH_MARK_DIR/confirmed-$grp"
+  # RemainAfterElapse=no: a fired timer disappears instead of lingering as
+  # "active (elapsed)"; firing is detected through the rolledback marker.
+  # AccuracySec=1s: the default (1min) could stretch the window by a minute.
   systemd-run --quiet --on-active="${HARDEN_ROLLBACK_SECONDS}s" --unit="$unit" \
+    --timer-property=RemainAfterElapse=no --timer-property=AccuracySec=1s \
     --description="linux-hardening auto-rollback ($grp)" /bin/bash "$f" || {
       restore_group_files_now "$grp"
       die_group "could not schedule rollback with systemd-run; restored files, $grp changes not activated"
     }
+  echo "$grp" >>"$LH_MARK_DIR/txn"
   echo "$grp" >>"$LH_RUN_DIR/pending"
   log_info "auto-rollback scheduled: $unit fires in ${HARDEN_ROLLBACK_SECONDS}s unless confirmed"
 }
@@ -624,12 +666,17 @@ cancel_rollback() {
   touch "$LH_MARK_DIR/confirmed-$grp"
 }
 
-# Run the rollback for <grp> right now (verification failed).
+# Run the rollback for <grp> right now (verification failed). The script
+# also rolls back the other groups of the transaction.
 rollback_now() {
   local grp=$1
-  if [[ -f $LH_RUN_DIR/pending ]]; then sed -i "/^${grp}\$/d" "$LH_RUN_DIR/pending"; fi
   systemctl stop "$(rollback_unit "$grp").timer" >/dev/null 2>&1 || true
-  if [[ -f $LH_STATE_DIR/rollback-$grp.sh ]]; then bash "$LH_STATE_DIR/rollback-$grp.sh" >&2 || true; fi
+  if [[ -f $LH_STATE_DIR/rollback-$grp.sh ]]; then LH_ROLLBACK_FORCE=1 bash "$LH_STATE_DIR/rollback-$grp.sh" >&2 || true; fi
+}
+
+# Is the rollback timer of <grp> still waiting to fire?
+rollback_timer_waiting() {
+  [[ $(systemctl show --property=SubState --value "$(rollback_unit "$1").timer" 2>/dev/null || true) == waiting ]]
 }
 
 # Restore this run's backup of <grp> immediately, without reload (validation failure).
@@ -654,4 +701,111 @@ ssh_alive() {
     : "$i"
   done
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# Who is running us over SSH? (for --yes refusals, safety rule 3)
+# sudo strips SSH_CONNECTION, so walk up the process tree: the topmost
+# ancestor carrying SSH_CONNECTION is the login shell of the SSH session.
+# Sets LH_SSH_CLIENT (client IP) and LH_SSH_USER (session owner); empty when
+# not run from an SSH session.
+# ---------------------------------------------------------------------------
+LH_SSH_CLIENT="" LH_SSH_USER=""
+lh_ssh_session() {
+  local pid=$$ conn uid n=0
+  LH_SSH_CLIENT="" LH_SSH_USER=""
+  if [[ -n ${SSH_CONNECTION:-} ]]; then LH_SSH_CLIENT=${SSH_CONNECTION%% *}; fi
+  while [[ $pid =~ ^[0-9]+$ ]] && (( pid > 1 && n++ < 64 )); do
+    conn=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^SSH_CONNECTION=//p' | head -n1 || true)
+    if [[ -n $conn ]]; then
+      LH_SSH_CLIENT=${conn%% *}
+      uid=$(awk '$1 == "Uid:" { print $2 }' "/proc/$pid/status" 2>/dev/null || true)
+      [[ -n $uid ]] && LH_SSH_USER=$(getent passwd "$uid" | cut -d: -f1 || true)
+    fi
+    pid=$(awk '$1 == "PPid:" { print $2 }' "/proc/$pid/status" 2>/dev/null || true)
+  done
+  return 0
+}
+
+# The account whose access must survive: SUDO_USER, else the SSH session owner.
+lh_invoking_user() {
+  if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then printf '%s' "$SUDO_USER"; return 0; fi
+  lh_ssh_session
+  printf '%s' "$LH_SSH_USER"
+}
+
+# Unattended (--yes) runs cancel the rollback after local checks only; the
+# risky cases need HARDEN_UNATTENDED_FORCE=true.
+lh_unattended_guarded() {
+  [[ $LH_MODE == apply ]] && is_true "$LH_ASSUME_YES" && ! is_true "$HARDEN_UNATTENDED_FORCE"
+}
+
+# ---------------------------------------------------------------------------
+# Address matching (pure bash)
+# ---------------------------------------------------------------------------
+_ip4_to_int() {
+  local -a o; local x
+  [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r -a o <<<"$1"
+  for x in "${o[@]}"; do (( 10#$x <= 255 )) || return 1; done
+  printf '%d' $(( (10#${o[0]} << 24) | (10#${o[1]} << 16) | (10#${o[2]} << 8) | 10#${o[3]} ))
+}
+
+# IPv6 address -> 32 lowercase hex digits (handles ::, zone ids, dotted tail).
+_ip6_expand() {
+  local a=${1,,} head tail v4 n out="" g i
+  local -a hparts=() tparts=() all=()
+  a=${a%%%*}
+  [[ $a == *:* && $a =~ ^[0-9a-f:.]+$ ]] || return 1
+  if [[ $a =~ ^(.*:)([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    v4=$(_ip4_to_int "${BASH_REMATCH[2]}") || return 1
+    a="${BASH_REMATCH[1]}$(printf '%x:%x' $(( v4 >> 16 )) $(( v4 & 0xffff )))"
+  fi
+  if [[ $a == *::* ]]; then
+    head=${a%%::*}; tail=${a#*::}
+    [[ $tail == *::* ]] && return 1
+    [[ -n $head ]] && IFS=: read -r -a hparts <<<"$head"
+    [[ -n $tail ]] && IFS=: read -r -a tparts <<<"$tail"
+    n=$(( 8 - ${#hparts[@]} - ${#tparts[@]} ))
+    (( n >= 1 )) || return 1
+    all=("${hparts[@]}")
+    for (( i = 0; i < n; i++ )); do all+=(0); done
+    all+=("${tparts[@]}")
+  else
+    IFS=: read -r -a all <<<"$a"
+  fi
+  (( ${#all[@]} == 8 )) || return 1
+  for g in "${all[@]}"; do
+    [[ $g =~ ^[0-9a-f]{1,4}$ ]] || return 1
+    out+=$(printf '%04x' "0x$g")
+  done
+  printf '%s' "$out"
+}
+
+# ip_in_cidr ADDR CIDR -> 0 if ADDR is inside CIDR (v4 or v6; a bare address
+# is a /32 or /128). IPv4-mapped IPv6 clients are matched as IPv4.
+ip_in_cidr() {
+  local addr=$1 cidr=$2 net len a n mask full rem an nn
+  net=${cidr%/*}
+  [[ $cidr == */* ]] && len=${cidr#*/} || len=""
+  if [[ $addr =~ ^::ffff:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then addr=${BASH_REMATCH[1]}; fi
+  if [[ $net != *:* ]]; then
+    [[ $addr != *:* ]] || return 1
+    a=$(_ip4_to_int "$addr") || return 1
+    n=$(_ip4_to_int "$net") || return 1
+    len=${len:-32}; (( len <= 32 )) || return 1
+    mask=$(( len == 0 ? 0 : (0xffffffff << (32 - len)) & 0xffffffff ))
+    (( (a & mask) == (n & mask) ))
+  else
+    [[ $addr == *:* ]] || return 1
+    a=$(_ip6_expand "$addr") || return 1
+    n=$(_ip6_expand "$net") || return 1
+    len=${len:-128}; (( len <= 128 )) || return 1
+    full=$(( len / 4 )); rem=$(( len % 4 ))
+    [[ ${a:0:full} == "${n:0:full}" ]] || return 1
+    (( rem == 0 )) && return 0
+    an=$(( 0x${a:full:1} )); nn=$(( 0x${n:full:1} ))
+    mask=$(( (0xf << (4 - rem)) & 0xf ))
+    (( (an & mask) == (nn & mask) ))
+  fi
 }
