@@ -67,7 +67,8 @@ Modes:
   --list-backups      list backups under $LH_BACKUP_ROOT
 
 Options:
-  --yes               non-interactive (no prompts; rollback auto-cancelled once sshd verified)
+  --yes               non-interactive (no prompts; rollback auto-cancelled once sshd verified;
+                      refuses risky SSH changes unless HARDEN_UNATTENDED_FORCE=true)
   --config FILE       extra config file (overrides /etc/linux-hardening.conf; env overrides both)
   --only g1,g2        run only these groups
   --skip g1,g2        skip these groups
@@ -142,8 +143,11 @@ run_group() {
 # ---------------------------------------------------------------------------
 # Confirmation of SSH/firewall changes (safety rule 3)
 # ---------------------------------------------------------------------------
+# Pending SSH/firewall rollbacks are one transaction: all are cancelled
+# together, or all roll back. Rolling back only one of them can leave sshd on
+# one port and the firewall open on another.
 confirm_pending_rollbacks() {
-  local pending=() g waited=0 limit all_done
+  local pending=() g failed=() why
   [[ -f $LH_RUN_DIR/pending ]] || return 0
   mapfile -t pending < <(sort -u "$LH_RUN_DIR/pending")
   rm -f "$LH_RUN_DIR/pending"
@@ -151,9 +155,92 @@ confirm_pending_rollbacks() {
   CURRENT_GROUP=confirm
 
   if [[ -t 0 ]] && ! is_true "$LH_ASSUME_YES"; then
-    mkdir -p "$LH_MARK_DIR"
-    printf '%s\n' "${SSH_CONNECTION:-}" >"$LH_MARK_DIR/session"
-    cat >&2 <<EOF
+    _txn_any_rolledback "${pending[@]}" || _confirm_wait_interactive "${pending[@]}"
+    if _txn_any_rolledback "${pending[@]}"; then
+      lh_txn_lock
+      for g in "${pending[@]}"; do [[ -e $LH_MARK_DIR/rolledback-$g ]] && failed+=("$g"); done
+      _txn_rollback_all "rollback of ${failed[*]} fired or verification failed" "${pending[@]}"
+      lh_txn_unlock
+      return 0
+    fi
+    for g in "${pending[@]}"; do
+      CURRENT_GROUP=$g
+      if [[ -e $LH_MARK_DIR/confirmed-$g ]]; then
+        log_info "confirmed; rollback cancelled"
+      else
+        mark_warn "no confirmation seen; rollback unit $(rollback_unit "$g") may still be pending"
+      fi
+    done
+    CURRENT_GROUP=main
+    return 0
+  fi
+
+  # --yes: verify every group, then cancel all or roll back all.
+  lh_txn_lock
+  for g in "${pending[@]}"; do
+    CURRENT_GROUP=$g
+    why=""
+    if [[ -e $LH_MARK_DIR/rolledback-$g ]]; then
+      why="already rolled back"
+    else
+      case $g in
+        ssh)
+          if [[ -e $LH_RUN_DIR/ssh_port_changed && ! -e $LH_RUN_DIR/firewall_ok ]]; then
+            why="SSH port changed but the firewall group did not open it in this run (skipped/failed/ufw)"
+          elif ! ssh_alive; then
+            why="sshd not valid/active/listening on $HARDEN_SSH_PORT"
+          fi ;;
+        firewall)
+          if [[ ! -e $LH_RUN_DIR/firewall_ok ]]; then
+            why="firewall group did not complete"
+          elif ! _group_still_active firewall; then
+            why="firewall rules not active"
+          fi ;;
+      esac
+    fi
+    if [[ -n $why ]]; then failed+=("$g: $why"); log_error "verification failed: $why"; fi
+  done
+  CURRENT_GROUP=confirm
+  if (( ${#failed[@]} )); then
+    _txn_rollback_all "$(IFS=';'; echo "${failed[*]}")" "${pending[@]}"
+  else
+    for g in "${pending[@]}"; do cancel_rollback "$g"; done
+    for g in "${pending[@]}"; do
+      CURRENT_GROUP=$g
+      log_info "all pending groups verified (${pending[*]}); rollback cancelled"
+    done
+  fi
+  lh_txn_unlock
+  CURRENT_GROUP=main
+}
+
+_txn_any_rolledback() {
+  local g
+  for g in "$@"; do [[ -e $LH_MARK_DIR/rolledback-$g ]] && return 0; done
+  return 1
+}
+
+# _txn_rollback_all REASON GROUP... (caller holds the transaction lock)
+_txn_rollback_all() {
+  local reason=$1 g; shift
+  log_error "rolling back ALL pending changes ($*) together: $reason"
+  for g in "$@"; do
+    [[ -e $LH_MARK_DIR/rolledback-$g ]] || rollback_now "$g"
+  done
+  for g in "$@"; do
+    CURRENT_GROUP=$g
+    mark_error "rolled back as part of the SSH/firewall transaction ($reason)"
+  done
+  CURRENT_GROUP=main
+}
+
+# Wait until every group is confirmed (--confirm) or any has rolled back.
+_confirm_wait_interactive() {
+  local -a pending=("$@")
+  local g waited=0 limit all_conf
+  mkdir -p "$LH_MARK_DIR"
+  printf '%s\n' "${SSH_CONNECTION:-}" >"$LH_MARK_DIR/session"
+  cat >&2 <<EOF
 
   ============================================================================
   SSH/firewall changes are active (${pending[*]}). They will be ROLLED BACK in
@@ -165,42 +252,15 @@ confirm_pending_rollbacks() {
   Keep this session open. Ctrl-C here does not cancel the rollback.
   ============================================================================
 EOF
-    limit=$(( HARDEN_ROLLBACK_SECONDS + 30 ))
-    while (( waited < limit )); do
-      all_done=true
-      for g in "${pending[@]}"; do
-        if [[ ! -e $LH_MARK_DIR/confirmed-$g && ! -e $LH_MARK_DIR/rolledback-$g ]]; then all_done=false; fi
-      done
-      $all_done && break
-      sleep 2
-      waited=$(( waited + 2 ))
-    done
-    for g in "${pending[@]}"; do
-      CURRENT_GROUP=$g
-      if [[ -e $LH_MARK_DIR/rolledback-$g ]]; then
-        mark_error "not confirmed in time: changes were rolled back"
-      elif [[ -e $LH_MARK_DIR/confirmed-$g ]]; then
-        log_info "confirmed; rollback cancelled"
-      else
-        mark_warn "no confirmation seen; rollback unit $(rollback_unit "$g") may still be pending"
-      fi
-    done
-  else
-    for g in "${pending[@]}"; do
-      CURRENT_GROUP=$g
-      if [[ $g == ssh && -e $LH_RUN_DIR/ssh_port_changed && ! -e $LH_RUN_DIR/firewall_ok ]]; then
-        rollback_now "$g"
-        mark_error "SSH port changed but the firewall group did not open it in this run (skipped/failed/ufw): rolled back"
-      elif ssh_alive && _group_still_active "$g"; then
-        cancel_rollback "$g"
-        log_info "sshd verified (config valid, active, listening on $HARDEN_SSH_PORT); rollback cancelled"
-      else
-        rollback_now "$g"
-        mark_error "post-change verification failed: rolled back"
-      fi
-    done
-  fi
-  CURRENT_GROUP=main
+  limit=$(( HARDEN_ROLLBACK_SECONDS + 30 ))
+  while (( waited < limit )); do
+    all_conf=true
+    for g in "${pending[@]}"; do [[ -e $LH_MARK_DIR/confirmed-$g ]] || all_conf=false; done
+    $all_conf && return 0
+    _txn_any_rolledback "${pending[@]}" && return 0
+    sleep 2
+    waited=$(( waited + 2 ))
+  done
 }
 
 _group_still_active() {
@@ -212,26 +272,55 @@ _group_still_active() {
   esac
 }
 
+# Groups of the current transaction, plus any rollback timer still loaded.
+_txn_groups() {
+  {
+    cat "$LH_MARK_DIR/txn" 2>/dev/null || true
+    systemctl list-units --all --plain --no-legend --no-pager 'hardening-rollback-*.timer' 2>/dev/null \
+      | awk '{print $1}' | sed -n 's/^hardening-rollback-\([a-z0-9]*\)\.timer$/\1/p' || true
+  } | sort -u
+}
+
+# --confirm: cancel all pending rollbacks, unless one of the transaction has
+# already fired; then roll back the rest too (never confirm half of it).
 do_confirm() {
-  local units u g found=false sess
+  local g sess pending=() fired=() confirmed=()
   sess=$(cat "$LH_MARK_DIR/session" 2>/dev/null || true)
   if [[ -n $sess && $sess == "${SSH_CONNECTION:-}" ]]; then
     log_warn "this looks like the same SSH session that ran the hardening; a NEW session proves more"
   fi
-  units=$(systemctl list-units --all --plain --no-legend --no-pager 'hardening-rollback-*.timer' 2>/dev/null | awk '{print $1}' || true)
-  mkdir -p "$LH_MARK_DIR"
-  for u in $units; do
-    g=${u#hardening-rollback-}; g=${g%.timer}
-    if [[ -e $LH_MARK_DIR/rolledback-$g ]] || ! systemctl is-active --quiet "$u" \
-       || systemctl is-active --quiet "${u%.timer}.service"; then
-      echo "TOO LATE: $u already fired; $g changes were (or are being) rolled back" >&2
-      continue
+  lh_txn_lock
+  for g in $(_txn_groups); do
+    if [[ -e $LH_MARK_DIR/rolledback-$g ]] || systemctl is-active --quiet "$(rollback_unit "$g").service"; then
+      fired+=("$g")
+    elif rollback_timer_waiting "$g"; then
+      pending+=("$g")
+    elif [[ -e $LH_MARK_DIR/confirmed-$g ]]; then
+      confirmed+=("$g")
+    else
+      fired+=("$g")  # timer gone without a marker: fail closed
     fi
-    cancel_rollback "$g"
-    echo "cancelled $u"
-    found=true
   done
-  $found || echo "no pending rollback units"
+  if (( ${#fired[@]} )); then
+    for g in "${fired[@]}"; do
+      echo "TOO LATE: $(rollback_unit "$g").timer already fired; $g changes were (or are being) rolled back" >&2
+    done
+    for g in "${pending[@]}"; do
+      echo "rolling back $g now as well: SSH and firewall changes are confirmed or rolled back together" >&2
+      rollback_now "$g"
+    done
+    lh_txn_unlock
+    echo "nothing was confirmed; this run's SSH/firewall changes are rolled back. Fix the cause and re-run harden.sh." >&2
+    exit 1
+  fi
+  for g in "${pending[@]}"; do
+    cancel_rollback "$g"
+    echo "cancelled $(rollback_unit "$g").timer"
+  done
+  lh_txn_unlock
+  if (( ${#pending[@]} == 0 )); then
+    if (( ${#confirmed[@]} )); then echo "already confirmed: ${confirmed[*]}"; else echo "no pending rollback units"; fi
+  fi
 }
 
 do_list_backups() {
@@ -393,9 +482,14 @@ main() {
   flock -n 9 || die "another harden.sh run is in progress"
 
   if [[ $LH_MODE == apply ]]; then
-    local pend
-    pend=$(systemctl list-timers --all --plain --no-legend 'hardening-rollback-*.timer' 2>/dev/null | grep -o 'hardening-rollback-[a-z0-9]*\.timer' || true)
-    [[ -z $pend ]] || die "auto-rollback still pending from an earlier run ($pend): run --confirm or wait for it"
+    local pend="" u
+    for u in $(systemctl list-units --all --plain --no-legend --no-pager 'hardening-rollback-*.timer' 2>/dev/null | awk '{print $1}' || true); do
+      g=${u#hardening-rollback-}; g=${g%.timer}
+      if rollback_timer_waiting "$g"; then pend+="$u "
+      else systemctl stop "$u" >/dev/null 2>&1 || true  # elapsed leftover (older versions)
+      fi
+    done
+    [[ -z $pend ]] || die "auto-rollback still pending from an earlier run (${pend% }): run --confirm or wait for it"
   fi
 
   LH_TS=$(date +%Y%m%d-%H%M%S)

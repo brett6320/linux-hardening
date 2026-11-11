@@ -57,7 +57,19 @@ Detection: `/etc/os-release` `ID` then `ID_LIKE`. Unknown → abort.
    - Shell: if stdin is a TTY, ask the operator to confirm from a **new** SSH
      session (`harden.sh --confirm`) within the window; non-interactive runs
      (`--yes`) cancel the rollback once `sshd -t` passes and sshd is active
-     and listening on the port.
+     and listening on the port. Because that check is local-only, `--yes`
+     refuses (aborts the group) unless `HARDEN_UNATTENDED_FORCE=true` when:
+     the SSH port changes; the SSH client address of the invoking session is
+     outside `ADMIN_SOURCES` (when set); or the invoking user (`SUDO_USER`,
+     else the SSH session owner) is not in `SSH_ALLOW_USERS` or would lose
+     password auth without authorized keys.
+   - The pending SSH and firewall rollbacks of a run are **one transaction**:
+     they are cancelled together only when every group verified; if any
+     group failed verification or its rollback already fired, all of them
+     roll back immediately (a fired rollback also rolls back the others, and
+     `--confirm` then cancels nothing). Timers use `RemainAfterElapse=no`;
+     a fired rollback is detected by the marker the rollback script writes
+     (`/run/linux-hardening/rolledback-<group>`).
 4. Every file modified is backed up first to
    `/var/backups/linux-hardening/<timestamp>/<original path>` with a
    `manifest` listing created (vs modified) files. `--restore <timestamp>`
@@ -91,6 +103,7 @@ YAML lists, shell uses space-separated strings.
 | HARDEN_FIREWALL_FORCE       | false    | see safety rule 2 |
 | HARDEN_FIREWALL_IGNORE_LISTENERS | udp/5353 tcp/5355 udp/5355 | listeners the precheck ignores (mDNS/LLMNR — meant to be blocked) |
 | HARDEN_ROLLBACK_SECONDS     | 120      | |
+| HARDEN_UNATTENDED_FORCE     | false    | let `--yes` apply the risky SSH changes of safety rule 3 anyway |
 | HARDEN_DISABLE_IPV6         | false    | |
 | HARDEN_IPV6_ACCEPT_RA_OFF   | false    | opt-in; breaks SLAAC/cloud v6 |
 | HARDEN_KEXEC_DISABLE        | false    | true breaks kdump |
@@ -194,12 +207,15 @@ MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
   for idempotent reload; **no `flush ruleset`, no forward chain** (Docker,
   K8s, libvirt keep working). `/etc/nftables.conf` gets an `include
   "/etc/nftables.d/*.nft"` line if absent (keep existing content). Enable `nftables`.
-- rhel/suse (firewalld): enable firewalld; set default zone `drop`; move only
+- rhel/suse (firewalld): enable firewalld; move only
   the default-route interface(s) (from `ip route show default` /
   `ip -6 route show default`) into `drop` — never docker*/cni*/veth*/wg*/tailscale*/virbr*;
   permanently add SSH + allowed ports, `dhcpv6-client` service, protocols
   `icmp` and `ipv6-icmp`; if ADMIN_SOURCES set, SSH via rich rules per source
-  instead of plain port. Reload.
+  instead of plain port; all of this goes into zone `drop`. Reload. The
+  **default zone is left unchanged**: interfaces firewalld doesn't know
+  (cni0, cali*, flannel.1, docker0/virbr0 created before firewalld) fall into
+  it, and `drop` there would cut container/VM forwarding and egress.
 - Docker caveat (documented, not managed): ports published with `-p` bypass
   INPUT; use `DOCKER-USER` or bind to 127.0.0.1.
 - Wrap in auto-rollback (safety rule 3).

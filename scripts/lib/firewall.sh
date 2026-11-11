@@ -185,22 +185,43 @@ fw_missing_items() {
   fi
 }
 
+# --yes with ADMIN_SOURCES: refuse when the SSH session we run from would not
+# be allowed back in. Prints the reason and succeeds when refusing.
+fw_unattended_refusal() {
+  local s
+  lh_unattended_guarded || return 1
+  [[ -n $HARDEN_ADMIN_SOURCES ]] || return 1
+  lh_ssh_session
+  [[ -n $LH_SSH_CLIENT ]] || return 1
+  for s in $HARDEN_ADMIN_SOURCES; do ip_in_cidr "$LH_SSH_CLIENT" "$s" && return 1; done
+  if [[ $LH_SSH_CLIENT == *:* ]] && ! _ip6_expand "$LH_SSH_CLIENT" >/dev/null; then
+    echo "your SSH client address '$LH_SSH_CLIENT' could not be parsed"; return 0
+  fi
+  echo "your SSH client address $LH_SSH_CLIENT is not in HARDEN_ADMIN_SOURCES ($HARDEN_ADMIN_SOURCES)"
+}
+
+fw_refuse_msg() { echo "--yes: refusing because $1; run interactively (confirm from a new session) or set HARDEN_UNATTENDED_FORCE=true"; }
+
 apply_firewall_firewalld() {
   local -a missing
-  local kind val dz running=false enabled=false i
+  local kind val dz running=false enabled=false i reason
   command -v firewall-cmd >/dev/null 2>&1 || { mark_skip "firewalld not installed"; return 0; }
   fw_running && running=true
   [[ $(unit_state firewalld) == enabled ]] && enabled=true
+  # The default zone is left alone: interfaces firewalld doesn't know about
+  # (cni0, cali*, flannel.1, docker0/virbr0 created before firewalld) fall
+  # into it, and 'drop' would cut their forwarding/egress.
   dz=$(fwq --get-default-zone 2>/dev/null || true)
+  [[ -n $(fw_default_ifaces) ]] || mark_warn "no default-route interface found: nothing bound to zone $FW_ZONE"
   mapfile -t missing < <(fw_missing_items)
 
-  if [[ $dz == "$FW_ZONE" ]] && $running && $enabled && (( ${#missing[@]} == 0 )); then return 0; fi
+  if $running && $enabled && (( ${#missing[@]} == 0 )); then return 0; fi
 
-  [[ $dz == "$FW_ZONE" ]] || mark_changed "firewalld default zone $dz -> $FW_ZONE"
   for i in "${missing[@]}"; do mark_changed "firewalld zone $FW_ZONE: ${i/$'\t'/ }"; done
   $running || mark_changed "start firewalld"
   $enabled || mark_changed "enable firewalld"
   [[ $LH_MODE == check ]] && return 0
+  if reason=$(fw_unattended_refusal); then die_group "$(fw_refuse_msg "$reason")"; fi
 
   backup_dir /etc/firewalld
   manifest_note firewalld_was_active "$($running && echo yes || echo no)"
@@ -211,14 +232,14 @@ apply_firewall_firewalld() {
     manifest_note iface_prev_zone "$val=${kind:-$dz}"
   done
   schedule_rollback firewall
-  if ! fw_firewalld_activate "$dz" "$running" "$enabled" "${missing[@]}"; then
+  if ! fw_firewalld_activate "$running" "$enabled" "${missing[@]}"; then
     rollback_now firewall
     die_group "configuring firewalld failed; rolled back"
   fi
 }
 
-fw_firewalld_activate() { # default_zone running enabled items...
-  local dz=$1 running=$2 enabled=$3 i kind val; shift 3
+fw_firewalld_activate() { # running enabled items...
+  local running=$1 enabled=$2 i kind val; shift 2
   for i in "$@"; do
     kind=${i%%$'\t'*}; val=${i#*$'\t'}
     case $kind in
@@ -227,7 +248,6 @@ fw_firewalld_activate() { # default_zone running enabled items...
       *) fwp --zone="$FW_ZONE" "--add-$kind=$val" >/dev/null || return 1 ;;
     esac
   done
-  if [[ $dz != "$FW_ZONE" ]]; then fwq --set-default-zone="$FW_ZONE" >/dev/null || return 1; fi
   if $running; then
     firewall-cmd --reload >/dev/null || return 1
     for i in $(fw_default_ifaces); do
@@ -241,7 +261,7 @@ fw_firewalld_activate() { # default_zone running enabled items...
 }
 
 apply_firewall_nftables() {
-  local tmp content loaded=false file_changed=0 conf_mode=0755 was_enabled
+  local tmp content loaded=false file_changed=0 conf_mode=0755 was_enabled reason
   command -v nft >/dev/null 2>&1 || { mark_skip "nftables not installed"; return 0; }
   content=$(fw_render_nft)
   tmp=$(mktemp "$LH_RUN_DIR/nft.XXXXXX")
@@ -272,6 +292,10 @@ apply_firewall_nftables() {
       mark_changed "load $FW_NFT_FILE"
     else
       manifest_note nft_table_was_loaded "$($loaded && echo yes || echo no)"
+      if reason=$(fw_unattended_refusal); then
+        restore_group_files_now firewall
+        die_group "$(fw_refuse_msg "$reason"); restored previous files"
+      fi
       [[ $was_enabled == enabled ]] || manifest_note nftables_was_enabled no
       schedule_rollback firewall
       if ! nft -f "$FW_NFT_FILE"; then
@@ -324,8 +348,7 @@ audit_firewall() {
     audit_check "firewalld enabled" systemctl is-enabled --quiet firewalld
     if ! fw_running; then audit_fail "firewalld active"; return 0; fi
     audit_pass "firewalld active"
-    z=$(firewall-cmd --get-default-zone 2>/dev/null || true)
-    if [[ $z == "$FW_ZONE" ]]; then audit_pass "default zone $FW_ZONE"; else audit_fail "default zone $FW_ZONE (is $z)"; fi
+    [[ -n $(fw_default_ifaces) ]] || audit_fail "a default-route interface is bound to zone $FW_ZONE (none found)"
     while IFS=$'\t' read -r kind val; do
       if [[ $kind == interface ]]; then
         z=$(firewall-cmd --get-zone-of-interface="$val" 2>/dev/null || true)

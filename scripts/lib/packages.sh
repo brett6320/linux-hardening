@@ -107,18 +107,31 @@ apply_packages() {
   fi
 
   # Last, so updates from repos enabled above (EPEL, PackageHub) are included.
+  # A second pass catches updates that only appear after the first one, e.g.
+  # an updated epel-release repointing EPEL to a newer minor-version repo.
   if is_true "$HARDEN_APPLY_UPDATES"; then
-    n=$(pending_update_count)
-    if (( n > 0 )); then
-      mark_changed "apply $n pending updates"
-      case $OS_FAMILY in
-        debian) run env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get -q -y -o Dpkg::Options::=--force-confold upgrade --with-new-pkgs ;;
-        rhel) run dnf -q -y upgrade ;;
-        suse) if $IS_TUMBLEWEED; then run zypper -n -q dup --auto-agree-with-licenses
-              else run zypper -n -q update --auto-agree-with-licenses; fi ;;
-      esac
-    fi
+    local pass
+    for pass in 1 2; do
+      if (( pass == 2 )); then
+        [[ $LH_MODE == apply ]] || break
+        pkg_refresh >/dev/null 2>&1 || true
+      fi
+      n=$(pending_update_count)
+      (( n > 0 )) || break
+      if (( pass == 1 )); then mark_changed "apply $n pending updates"
+      else mark_changed "apply $n more updates that appeared after the first pass"; fi
+      packages_upgrade || mark_warn "applying updates failed"
+    done
   fi
+}
+
+packages_upgrade() {
+  case $OS_FAMILY in
+    debian) run env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get -q -y -o Dpkg::Options::=--force-confold upgrade --with-new-pkgs ;;
+    rhel) run dnf -q -y upgrade ;;
+    suse) if $IS_TUMBLEWEED; then run zypper -n -q dup --auto-agree-with-licenses
+          else run zypper -n -q update --auto-agree-with-licenses; fi ;;
+  esac
 }
 
 audit_packages() {

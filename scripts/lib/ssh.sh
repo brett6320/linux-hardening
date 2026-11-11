@@ -212,6 +212,42 @@ ssh_render_dropin() {
   ssh_desired_settings
 }
 
+_ssh_key_capable() { # user
+  local ent akc
+  akc=$(sshd_t_get authorizedkeyscommand | head -n1)
+  [[ -n $akc && ${akc,,} != none ]] && return 0
+  ent=$(getent passwd "$1") || return 1
+  ssh_user_has_keys "$1" "$(cut -d: -f6 <<<"$ent")" "$(cut -d: -f3 <<<"$ent")"
+}
+
+# --yes cancels the rollback after local checks only, which cannot see these
+# lockouts. Prints the reason and succeeds when the change must be refused.
+ssh_unattended_refusal() { # old_ports
+  local u
+  lh_unattended_guarded || return 1
+  if [[ $1 != "$HARDEN_SSH_PORT" ]]; then
+    echo "the SSH port changes ($1 -> $HARDEN_SSH_PORT)"; return 0
+  fi
+  u=$(lh_invoking_user)
+  [[ -n $u ]] || return 1
+  if [[ $u == root ]]; then
+    if [[ $SSH_ROOT_LOGIN == no ]]; then
+      echo "you are logged in as root and PermitRootLogin would become 'no'"; return 0
+    fi
+    if $SSH_KEY_ONLY && ! _ssh_key_capable root; then
+      echo "password authentication would be disabled and root has no authorized keys"; return 0
+    fi
+    return 1
+  fi
+  if [[ -n $HARDEN_SSH_ALLOW_USERS ]] && ! _in_words "$u" "$HARDEN_SSH_ALLOW_USERS"; then
+    echo "you ($u) are not in HARDEN_SSH_ALLOW_USERS"; return 0
+  fi
+  if $SSH_KEY_ONLY && ! _ssh_key_capable "$u"; then
+    echo "password authentication would be disabled and you ($u) have no authorized keys"; return 0
+  fi
+  return 1
+}
+
 ssh_include_present() {
   grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$1" 2>/dev/null
 }
@@ -253,7 +289,7 @@ ssh_selinux_port() {
 }
 
 apply_ssh() {
-  local sshd main old_ports changed=0 w eff exp key
+  local sshd main old_ports changed=0 w eff exp key reason
   sshd=$(sshd_bin)
   [[ -x $sshd ]] || { mark_skip "sshd not installed"; return 0; }
   ssh_load_effective || die_group "sshd -T failed: current sshd configuration is invalid; not touching it"
@@ -276,6 +312,11 @@ apply_ssh() {
 
   # Include must be in effect for the drop-in.
   main=$(ssh_main_config)
+  if ! ssh_include_present "$main" || [[ ! -f $SSH_DROPIN || "$(cat "$SSH_DROPIN")" != "$(ssh_render_dropin)" ]]; then
+    if reason=$(ssh_unattended_refusal "$old_ports"); then
+      die_group "--yes: refusing because $reason; the unattended check is local-only and can't prove you can log in again. Run interactively (confirm from a new session) or set HARDEN_UNATTENDED_FORCE=true"
+    fi
+  fi
   if ! ssh_include_present "$main"; then
     if [[ $main == /etc/ssh/sshd_config && -f $main ]]; then
       install_content "$main" 0600 root:root "$(printf 'Include /etc/ssh/sshd_config.d/*.conf\n'; cat "$main")"
