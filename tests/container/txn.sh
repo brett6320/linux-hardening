@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2015,SC2001  # ok/bad always return 0; sed indents multi-line output
 # Self-test for the SSH/firewall rollback transaction (shell implementation).
-# Usage: tests/container/txn.sh [base-image]   (default debian:12)
+# Usage: tests/container/txn.sh [base-image]   (default debian:12; debian family
+# only: it drives ssh.service and nftables)
 # Scenarios (each moves sshd to 2222, so a rollback is observable):
 #   1. ssh rollback has fired (marker) -> --confirm must roll back firewall too
 #   2. timers fire unconfirmed -> both rolled back, timers gone, next run not blocked
