@@ -116,13 +116,30 @@
     harden_warn_msg: "{{ harden_chrony_service }}.service not found (chrony not installed)"
   when: harden_svc_chrony.LoadState | default('') != 'loaded'
 
-- name: Services | enable and start chrony
+- name: Services | enable chrony
   ansible.builtin.systemd_service:
     name: "{{ harden_chrony_service }}"
     enabled: true
-    state: started
   register: harden_svc_chrony_on
   when: harden_svc_chrony.LoadState | default('') == 'loaded'
+
+# chronyd cannot adjust the clock in containers and exits; a start failure is
+# a warning, not a group failure (it never reports "changed" either).
+- name: Services | start chrony
+  ansible.builtin.systemd_service:
+    name: "{{ harden_chrony_service }}"
+    state: started
+  register: harden_svc_chrony_start
+  failed_when: false
+  when: harden_svc_chrony.LoadState | default('') == 'loaded'
+
+- name: Services | warn when chrony cannot start
+  ansible.builtin.include_tasks: _warn.yml
+  vars:
+    harden_warn_msg: >-
+      {{ harden_chrony_service }} could not be started (e.g. container without clock access):
+      {{ harden_svc_chrony_start.msg | default('') }}
+  when: (harden_svc_chrony_start.msg | default('')) is search('^(Unable to|Could not)')
 
 - name: Services | record group result
   ansible.builtin.include_tasks: _record.yml
@@ -132,3 +149,4 @@
       - "{{ harden_svc_mask | default({}) }}"
       - "{{ harden_svc_cad_mask | default({}) }}"
       - "{{ harden_svc_chrony_on | default({}) }}"
+      - "{{ harden_svc_chrony_start | default({}) }}"

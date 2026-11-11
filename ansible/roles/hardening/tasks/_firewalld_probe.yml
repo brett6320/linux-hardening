@@ -1,17 +1,11 @@
 ---
 # Internal: compare firewalld state with the desired "drop" zone setup and
 # compute the firewall-cmd invocations still needed.
-# Output facts: harden_fwd_perm_cmds, harden_fwd_if_cmds, harden_fwd_set_default,
+# The default zone is deliberately left alone: only the default-route
+# interface(s) are moved into "drop", so unbound interfaces (docker0, cni0,
+# cali*, flannel.1, virbr0, ...) keep the default zone and their forwarding.
+# Output facts: harden_fwd_perm_cmds, harden_fwd_if_cmds,
 #               harden_fwd_old_zones, harden_fwd_pending
-- name: Firewalld probe | read default zone
-  ansible.builtin.command:
-    argv: [firewall-cmd, --get-default-zone]
-  register: harden_fwd_def
-  changed_when: false
-  failed_when: false
-  check_mode: false
-  tags: [always]
-
 - name: Firewalld probe | read permanent drop zone settings
   ansible.builtin.command:
     argv: [firewall-cmd, --permanent, --zone=drop, "--list-{{ item }}"]
@@ -79,11 +73,10 @@
       {% set ns.d = ns.d | combine({r.item: r.stdout | trim}) -%}
       {% endfor -%}
       {{ ns.d }}
-    harden_fwd_set_default: "{{ (harden_fwd_def.stdout | default('') | trim) != 'drop' }}"
   tags: [always]
 
 - name: Firewalld probe | summarise
   ansible.builtin.set_fact:
     harden_fwd_pending: >-
-      {{ harden_fwd_perm_cmds | length > 0 or harden_fwd_if_cmds | length > 0 or harden_fwd_set_default | bool }}
+      {{ harden_fwd_perm_cmds | length > 0 or harden_fwd_if_cmds | length > 0 }}
   tags: [always]

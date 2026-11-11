@@ -123,19 +123,26 @@
         harden_warn_msg: AppArmor is not enabled in the kernel (container or boot parameter); service enabled only.
       when: not harden_mac_aa_on | bool
 
-    - name: MAC | enable AppArmor
-      block:
-        - name: MAC | enable and start apparmor service
-          ansible.builtin.systemd_service:
-            name: apparmor
-            enabled: true
-            state: "{{ 'started' if harden_mac_aa_on | bool else omit }}"
-          register: harden_mac_aa
-      rescue:
-        - name: MAC | warn when AppArmor cannot start (e.g. container)
-          ansible.builtin.include_tasks: _warn.yml
-          vars:
-            harden_warn_msg: "apparmor could not be started: {{ ansible_failed_result.msg | default('') }}"
+    - name: MAC | enable apparmor service
+      ansible.builtin.systemd_service:
+        name: apparmor
+        enabled: true
+      register: harden_mac_aa
+
+    # A start failure (e.g. container) is a warning only.
+    - name: MAC | start apparmor service
+      ansible.builtin.systemd_service:
+        name: apparmor
+        state: started
+      register: harden_mac_aa_start
+      failed_when: false
+      when: harden_mac_aa_on | bool
+
+    - name: MAC | warn when AppArmor cannot start (e.g. container)
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: "apparmor could not be started: {{ harden_mac_aa_start.msg | default('') }}"
+      when: (harden_mac_aa_start.msg | default('')) is search('^(Unable to|Could not)')
 
 - name: MAC | record group result
   ansible.builtin.include_tasks: _record.yml
@@ -143,3 +150,4 @@
     harden_rec_regs:
       - "{{ harden_mac_setenforce | default({}) }}"
       - "{{ harden_mac_aa | default({}) }}"
+      - "{{ harden_mac_aa_start | default({}) }}"

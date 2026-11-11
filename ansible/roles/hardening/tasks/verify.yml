@@ -46,7 +46,7 @@
       sshd: [/usr/sbin/sshd, -T]
       ufw: [ufw, status]
       nft: [nft, list, chain, inet, hardening, input]
-      fwd_default: [firewall-cmd, --get-default-zone]
+      fwd_ifzones: [sh, -c, "{{ harden_v_ifzone_sh }}"]
       fwd_ports: [firewall-cmd, --permanent, --zone=drop, --list-ports]
       fwd_services: [firewall-cmd, --permanent, --zone=drop, --list-services]
       fwd_protocols: [firewall-cmd, --permanent, --zone=drop, --list-protocols]
@@ -65,6 +65,11 @@
       cryptopol: [update-crypto-policies, --show]
       sysctl: >-
         {{ ['sh', '-c', harden_v_sysctl_sh, 'sh'] + (harden_v_sysctl | map('first') | list) }}
+    harden_v_ifzone_sh: >-
+      { ip route show default; ip -6 route show default; } 2>/dev/null
+      | sed -n 's/.* dev \([^ ]*\).*/\1/p' | sort -u
+      | grep -Ev '^(docker|cni|veth|wg|tailscale|virbr)'
+      | while read -r i; do printf '%s=%s\n' "$i" "$(firewall-cmd --get-zone-of-interface="$i" 2>/dev/null)"; done; exit 0
     harden_v_sysctl_sh: >-
       for k do p=/proc/sys/$(printf %s "$k" | tr ./ /.);
       [ -e "$p" ] && printf "%s=%s\n" "$k" "$(tr -s " \t" "  " < "$p")"; done; exit 0

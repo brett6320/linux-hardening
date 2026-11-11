@@ -2,7 +2,8 @@
 # Internal: schedule auto-rollback of the current group (safety rule 3).
 # Restores every file backed up for harden_grp so far, then runs
 # harden_rb_reload (shell snippet). Must be called after the backups and
-# before the change is applied.
+# before the change is applied. The script touches
+# rollback-<group>.fired first so _rollback_cancel.yml can detect that it ran.
 - name: Rollback | write rollback script
   ansible.builtin.copy:
     dest: "{{ harden_backup_dir }}/rollback-{{ harden_grp }}.sh"
@@ -13,6 +14,7 @@
       #!/bin/sh
       # linux-hardening auto-rollback for group "{{ harden_grp }}" (backup {{ harden_timestamp }}).
       # Started by the transient timer hardening-rollback-{{ harden_grp }} unless cancelled.
+      touch '{{ harden_backup_dir }}/rollback-{{ harden_grp }}.fired'
       {% for e in harden_backups[harden_grp] | default([]) | reverse %}
       {% if e.created %}
       rm -f -- '{{ e.path }}'
@@ -40,11 +42,20 @@
   when: not ansible_check_mode
   tags: [always]
 
+- name: Rollback | remove stale fired marker
+  ansible.builtin.file:
+    path: "{{ harden_backup_dir }}/rollback-{{ harden_grp }}.fired"
+    state: absent
+  when: not ansible_check_mode
+  tags: [always]
+
 - name: Rollback | schedule rollback timer
   ansible.builtin.command:
     argv:
       - systemd-run
       - "--on-active={{ harden_rollback_seconds }}"
+      # Without this a fired timer stays "active (elapsed)" and looks pending.
+      - --timer-property=RemainAfterElapse=no
       - "--unit=hardening-rollback-{{ harden_grp }}"
       - /bin/sh
       - "{{ harden_backup_dir }}/rollback-{{ harden_grp }}.sh"

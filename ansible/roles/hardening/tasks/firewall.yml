@@ -113,6 +113,14 @@
 - name: Firewall | firewalld backend (rhel/suse)
   when: harden_grp_skip | length == 0 and harden_firewall_backend == 'firewalld'
   block:
+    - name: Firewall | warn when no default-route interface was found
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: >-
+          No default-route interface found; the firewalld drop zone is configured but bound to no
+          interface (the default zone is left unchanged).
+      when: harden_fw_ifaces | length == 0
+
     - name: Firewall | probe firewalld service
       ansible.builtin.command:
         argv: [systemctl, show, -p, UnitFileState, -p, ActiveState, firewalld.service]
@@ -298,12 +306,6 @@
             argv: "{{ item }}"
           loop: "{{ harden_fwd_perm_cmds }}"
           changed_when: true
-
-        - name: Firewall | set default zone to drop
-          ansible.builtin.command:
-            argv: [firewall-cmd, --set-default-zone=drop]
-          changed_when: true
-          when: harden_fwd_set_default | bool
 
         - name: Firewall | reload firewalld
           ansible.builtin.command:

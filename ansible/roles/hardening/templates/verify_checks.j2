@@ -96,7 +96,13 @@
 {%- set fu = U['firewalld.service'] | default({}) -%}
 {%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'firewalld active+enabled',
      'r': 'pass' if fu.ActiveState | default('') == 'active' and fu.UnitFileState | default('') == 'enabled' else 'fail', 'd': ''}] -%}
-{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'default zone drop', 'r': 'pass' if (P.fwd_default.stdout | default('') | trim) == 'drop' else 'fail', 'd': P.fwd_default.stdout | default('') | trim}] -%}
+{%- set ifz = (P.fwd_ifzones.stdout_lines | default([])) | select('search', '=') | list -%}
+{%- for l in ifz -%}
+{%- set z = l.split('=', 1)[1] | trim -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'interface ' ~ l.split('=', 1)[0] ~ ' in drop', 'r': 'pass' if z == 'drop' else 'fail', 'd': z or 'none'}] -%}
+{%- else -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'default-route interface in drop', 'r': 'warn', 'd': 'no default-route interface'}] -%}
+{%- endfor -%}
 {%- if harden_admin_sources | length > 0 -%}
 {%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'ssh rich rules', 'r': 'pass' if (P.fwd_rich.stdout | default('')) is search('port="' ~ harden_ssh_port ~ '"') else 'fail', 'd': ''}] -%}
 {%- else -%}

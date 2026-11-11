@@ -97,8 +97,8 @@
 
             [Service]
             Type=oneshot
-            ExecStart=/usr/bin/zypper --non-interactive patch --category security
-            # 102: reboot needed, 103: zypper updated itself (patch run again next time)
+            ExecStart=/usr/bin/zypper --non-interactive patch --category security --auto-agree-with-licenses
+            # 100-103: patches applied / reboot or zypper restart needed
             SuccessExitStatus=100 101 102 103
         - path: /etc/systemd/system/hardening-autopatch.timer
           content: |
@@ -126,11 +126,11 @@
           content: |
             # Managed by linux-hardening.
             [Unit]
-            Description=linux-hardening: reboot if zypper needs-rebooting says so
+            Description=linux-hardening: reboot if patches require it
 
             [Service]
             Type=oneshot
-            ExecStart=/bin/sh -c 'zypper needs-rebooting >/dev/null 2>&1; [ $$? -eq 102 ] && systemctl reboot || true'
+            ExecStart=/bin/sh -c 'zypper -q needs-rebooting >/dev/null 2>&1; [ $$? -eq 102 ] && systemctl reboot || true'
         - path: /etc/systemd/system/hardening-autoreboot.timer
           content: |
             # Managed by linux-hardening.

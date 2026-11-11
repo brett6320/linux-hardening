@@ -9,9 +9,9 @@
   ansible.builtin.set_fact:
     harden_sysctl_base: >-
       {% set ns = namespace(out=[]) -%}
-      {% for l in lookup('ansible.builtin.file', harden_data_dir ~ '/sysctl.conf').splitlines() | map('trim')
-           if l | length > 0 and not l is match('^[#;]') and '=' in l -%}
-      {% set ns.out = ns.out + [{'key': l.split('=', 1)[0] | trim, 'value': l.split('=', 1)[1] | trim}] -%}
+      {% for l in lookup('ansible.builtin.file', harden_data_dir ~ '/sysctl.conf').splitlines()
+           | map('regex_replace', '#.*$', '') | map('trim') if '=' in l -%}
+      {% set ns.out = ns.out + [{'key': l.split('=', 1)[0] | regex_replace('\\s', ''), 'value': l.split('=', 1)[1] | trim}] -%}
       {% endfor -%}
       {% if harden_kexec_disable | bool -%}
       {% set ns.out = ns.out + [{'key': 'kernel.kexec_load_disabled', 'value': '1'}] -%}
@@ -26,23 +26,37 @@
       {% endif -%}
       {{ ns.out }}
 
-- name: Sysctl | list network interfaces
-  ansible.builtin.find:
-    paths: /sys/class/net
-    file_type: any
+# Same as scripts/lib/sysctl.sh: IPv4 only, interfaces under
+# /proc/sys/net/ipv4/conf except lo/all/default and ephemeral virtual ones,
+# '.' in interface names written as '/', value taken from conf.all.
+- name: Sysctl | list IPv4 interfaces
+  ansible.builtin.command:
+    argv: [ls, -1, /proc/sys/net/ipv4/conf]
   register: harden_sysctl_ifs
+  changed_when: false
+  failed_when: false
+  check_mode: false
 
 - name: Sysctl | add per-interface redirect/source-route keys
   ansible.builtin.set_fact:
     harden_sysctl_wanted: >-
       {% set ns = namespace(out=harden_sysctl_base) -%}
-      {% for e in harden_sysctl_base
-           if e.key is match('^net\\.ipv[46]\\.conf\\.all\\.(accept_redirects|secure_redirects|send_redirects|accept_source_route)$') -%}
-      {% for i in harden_sysctl_ifs.files | map(attribute='path') | map('basename') | reject('equalto', 'lo') | sort -%}
-      {% set ns.out = ns.out + [{'key': e.key | replace('.all.', '.' ~ (i | replace('.', '/')) ~ '.'), 'value': e.value}] -%}
+      {% set nv = namespace(allv={}) -%}
+      {% for e in harden_sysctl_base if e.key is match('^net\\.ipv4\\.conf\\.all\\.')
+           and e.key.split('.')[-1] not in nv.allv -%}
+      {% set nv.allv = nv.allv | combine({e.key.split('.')[-1]: e.value}) -%}
+      {% endfor -%}
+      {% set allv = nv.allv -%}
+      {% for i in harden_sysctl_ifs.stdout_lines | default([]) | map('trim') | sort
+           if i | length > 0 and not i is match(harden_sysctl_skip_if_re) -%}
+      {% for k in ['accept_redirects', 'secure_redirects', 'send_redirects', 'accept_source_route'] if k in allv -%}
+      {% set ns.out = ns.out + [{'key': 'net.ipv4.conf.' ~ (i | replace('.', '/')) ~ '.' ~ k, 'value': allv[k]}] -%}
       {% endfor -%}
       {% endfor -%}
       {{ ns.out }}
+  vars:
+    harden_sysctl_skip_if_re: >-
+      ^(lo|all|default|veth|docker|br-|cni|flannel|cali|lxc|virbr|vnet|tap|tun|wg|tailscale|kube|cilium|vxlan|genev)
 
 - name: Sysctl | find keys present in /proc/sys
   ansible.builtin.command:

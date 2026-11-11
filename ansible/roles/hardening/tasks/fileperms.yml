@@ -54,11 +54,6 @@
     path: /etc/fstab
   register: harden_fp_fstab_stat
 
-- name: Fileperms | report missing /etc/fstab
-  ansible.builtin.debug:
-    msg: /etc/fstab does not exist (container?); /dev/shm fstab entry skipped, runtime remount only.
-  when: not harden_fp_fstab_stat.stat.exists
-
 - name: Fileperms | read /etc/fstab
   ansible.builtin.slurp:
     src: /etc/fstab
@@ -77,7 +72,9 @@
     harden_l:
       path: /etc/fstab
       line: tmpfs /dev/shm tmpfs defaults,nodev,nosuid,noexec 0 0
-  when: harden_fp_shm_line | length == 0 and harden_fp_fstab_stat.stat.exists
+      create: true
+      mode: "0644"
+  when: harden_fp_shm_line | length == 0
 
 - name: Fileperms | add missing options to existing /dev/shm entry
   ansible.builtin.include_tasks: _line.yml

@@ -92,19 +92,25 @@
           content: "{{ harden_audit_content }}"
           mode: "0600"
 
-    - name: Auditd | enable and start auditd
-      block:
-        - name: Auditd | enable and start auditd service
-          ansible.builtin.systemd_service:
-            name: auditd
-            enabled: true
-            state: started
-          register: harden_audit_svc
-      rescue:
-        - name: Auditd | warn when auditd cannot start (e.g. container)
-          ansible.builtin.include_tasks: _warn.yml
-          vars:
-            harden_warn_msg: "auditd could not be started: {{ ansible_failed_result.msg | default('') }}"
+    - name: Auditd | enable auditd service
+      ansible.builtin.systemd_service:
+        name: auditd
+        enabled: true
+      register: harden_audit_svc
+
+    # No audit netlink in containers: a start failure is a warning only.
+    - name: Auditd | start auditd service
+      ansible.builtin.systemd_service:
+        name: auditd
+        state: started
+      register: harden_audit_start
+      failed_when: false
+
+    - name: Auditd | warn when auditd cannot start (e.g. container)
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: "auditd could not be started: {{ harden_audit_start.msg | default('') }}"
+      when: (harden_audit_start.msg | default('')) is search('^(Unable to|Could not)')
 
     - name: Auditd | load rules
       ansible.builtin.command:
@@ -145,3 +151,4 @@
   vars:
     harden_rec_regs:
       - "{{ harden_audit_svc | default({}) }}"
+      - "{{ harden_audit_start | default({}) }}"
