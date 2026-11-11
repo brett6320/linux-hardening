@@ -53,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [debian:12, rockylinux/rockylinux:9]
+        image: [debian:12, ubuntu:24.04]  # txn.sh drives ssh.service + nftables (debian family)
     steps:
       - uses: actions/checkout@v4
       - name: SSH/firewall rollback transaction self-test
