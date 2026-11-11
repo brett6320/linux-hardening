@@ -81,6 +81,23 @@ mark_error() { _result error "$1"; log_error "$1"; }
 # Abort the current group (we are inside the group subshell).
 die_group()  { mark_error "$1"; exit 3; }
 
+# Normalized directive set: drops comments (#, //) and blank lines, collapses
+# whitespace, sorts. Lets --audit accept a file written by the Ansible role,
+# which differs only in headers, ordering and spacing.
+# With "ordered", order is kept (nft rules are evaluated top to bottom).
+_directives() {
+  local sorter=(env LC_ALL=C sort -u)
+  [[ ${1:-} == ordered ]] && sorter=(cat)
+  sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+/ /g' -e 's/ $//' | grep -Ev '^(#|//|$)' | "${sorter[@]}"
+}
+
+# audit_content FILE EXPECTED [DESC] [ordered] -> pass when FILE has the same directives.
+audit_content() {
+  local desc="${3:-$1} up to date"
+  if [[ -f $1 && "$(_directives "${4:-}" <"$1")" == "$(_directives "${4:-}" <<<"$2")" ]]; then
+    audit_pass "$desc"; else audit_fail "$desc"; fi
+}
+
 audit_pass() { _result pass "$1"; log_info "PASS  $1"; }
 audit_fail() { _result fail "$1"; _log "$_C_RED" "FAIL  $1"; }
 audit_na()   { _result na "$1"; log_info "N/A   $1"; }

@@ -90,8 +90,7 @@ audit_fileperms() {
   else audit_fail "/dev/shm mounted nodev,nosuid,noexec"; fi
 
   if fp_tmp_is_tmpmount; then
-    if [[ -f $FP_TMP_DROPIN && "$(cat "$FP_TMP_DROPIN")" == "$(fp_render_tmp_dropin)" ]]; then
-      audit_pass "$FP_TMP_DROPIN up to date"; else audit_fail "$FP_TMP_DROPIN up to date"; fi
+    audit_content "$FP_TMP_DROPIN" "$(fp_render_tmp_dropin)"
     if _has_opts "$(fp_mount_opts /tmp)" nosuid nodev; then audit_pass "/tmp mounted nosuid,nodev"; else audit_fail "/tmp mounted nosuid,nodev"; fi
   else
     audit_na "/tmp not a tmp.mount tmpfs"

@@ -28,11 +28,11 @@ apply_logging() {
 
 audit_logging() {
   local st
-  if [[ -f $LOG_JOURNALD && "$(cat "$LOG_JOURNALD")" == "$(log_render_journald)" ]]; then audit_pass "$LOG_JOURNALD up to date"; else audit_fail "$LOG_JOURNALD up to date"; fi
+  audit_content "$LOG_JOURNALD" "$(log_render_journald)"
   st=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | awk -F= '/^Storage=/{v=$2} END{print v}' || true)
   if [[ $st == persistent ]]; then audit_pass "journald Storage=persistent (effective)"; else audit_fail "journald Storage=persistent (effective: ${st:-auto})"; fi
   if log_rsyslog_installed; then
-    if [[ -f $LOG_RSYSLOG && "$(cat "$LOG_RSYSLOG")" == "$(log_render_rsyslog)" ]]; then audit_pass "$LOG_RSYSLOG up to date"; else audit_fail "$LOG_RSYSLOG up to date"; fi
+    audit_content "$LOG_RSYSLOG" "$(log_render_rsyslog)"
   else
     audit_na "rsyslog not installed"
   fi

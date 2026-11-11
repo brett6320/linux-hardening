@@ -121,7 +121,7 @@ apply_accounts() {
 }
 
 _acc_audit_file() { # path expected
-  if [[ -f $1 && "$(cat "$1")" == "$2" ]]; then audit_pass "$1 up to date"; else audit_fail "$1 up to date"; fi
+  audit_content "$1" "$2"
 }
 
 audit_accounts() {

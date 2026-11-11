@@ -356,8 +356,7 @@ audit_ssh() {
   main=$(ssh_main_config)
   audit_check "$main includes sshd_config.d/*.conf" ssh_include_present "$main"
   ssh_compute_policy
-  if [[ -f $SSH_DROPIN && "$(cat "$SSH_DROPIN")" == "$(ssh_render_dropin)" ]]; then
-    audit_pass "$SSH_DROPIN up to date"; else audit_fail "$SSH_DROPIN up to date"; fi
+  audit_content "$SSH_DROPIN" "$(ssh_render_dropin)"
   while IFS= read -r line; do
     key=${line%% *}; exp=${line#* }
     eff=$(sshd_t_get "$key" | paste -sd' ' -)

@@ -94,7 +94,7 @@ apply_sysctl() {
 audit_sysctl() {
   local content mm key
   content=$(sysctl_render)
-  if [[ -f $SYSCTL_FILE && "$(cat "$SYSCTL_FILE")" == "$content" ]]; then audit_pass "$SYSCTL_FILE up to date"; else audit_fail "$SYSCTL_FILE up to date"; fi
+  audit_content "$SYSCTL_FILE" "$content"
   mm=$(sysctl_mismatches "$content")
   while IFS= read -r key; do
     [[ -z $key ]] && continue

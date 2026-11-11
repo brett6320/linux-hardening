@@ -64,7 +64,8 @@ Detection: `/etc/os-release` `ID` then `ID_LIKE`. Unknown → abort.
    reverts (delete created, restore modified, reload affected services).
 5. Drop-ins over editing vendor files. sshd: `/etc/ssh/sshd_config.d/00-hardening.conf`
    (sshd is first-match-wins, so it must sort **before** `50-cloud-init.conf`
-   / `50-redhat.conf`). Others: `99-hardening.*`.
+   / `50-redhat.conf`). modprobe: `00-hardening.conf` (first `install`
+   wins). Others: `99-hardening.*`.
 6. Idempotent: second run reports no changes (Ansible CI asserts `changed=0`).
 7. Dry-run: shell `--check`, Ansible `--check`.
 8. Each group can be disabled (`HARDEN_<GROUP>=false` / `harden_<group>: false`).
@@ -221,8 +222,10 @@ MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 - `net.ipv4.ip_forward` untouched; `rp_filter = 2` (loose; strict breaks
   Cilium/multi-homed).
 
-### modules — `/etc/modprobe.d/99-hardening.conf`
+### modules — `/etc/modprobe.d/00-hardening.conf`
 For each in `data/modules.list`: `install <mod> /bin/false` + `blacklist <mod>`.
+`00-` prefix because the first `install` line wins and SUSE ships
+`install <fs> …/unblacklist` hooks that would shadow a later file.
 Not blocked: squashfs (snap), udf (Azure provisioning), usb-storage (optional).
 
 ### auditd — `/etc/audit/rules.d/99-hardening.rules`, load with `augenrules --load`

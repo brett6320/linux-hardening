@@ -4,7 +4,7 @@
 # shellcheck source=common.sh
 [[ -n ${LH_COMMON_LOADED:-} ]] || source "${BASH_SOURCE[0]%/*}/common.sh"
 
-MODULES_FILE=/etc/modprobe.d/99-hardening.conf
+MODULES_FILE=/etc/modprobe.d/00-hardening.conf
 
 modules_render() {
   local m
@@ -32,7 +32,7 @@ apply_modules() {
 
 audit_modules() {
   local m out
-  if [[ -f $MODULES_FILE && "$(cat "$MODULES_FILE")" == "$(modules_render)" ]]; then audit_pass "$MODULES_FILE up to date"; else audit_fail "$MODULES_FILE up to date"; fi
+  audit_content "$MODULES_FILE" "$(modules_render)"
   while IFS= read -r m; do
     out=$(modprobe -n -v "$m" 2>&1 || true)
     if [[ $out == *"/bin/false"* ]]; then audit_pass "module $m blocked"; else audit_fail "module $m blocked"; fi

@@ -78,7 +78,7 @@ apply_auditd() {
 audit_auditd() {
   local f
   command -v auditctl >/dev/null 2>&1 || { audit_fail "auditd installed"; return 0; }
-  if [[ -f $AUDIT_FILE && "$(cat "$AUDIT_FILE")" == "$(auditd_render)" ]]; then audit_pass "$AUDIT_FILE up to date"; else audit_fail "$AUDIT_FILE up to date"; fi
+  audit_content "$AUDIT_FILE" "$(auditd_render)"
   audit_check "auditd enabled" systemctl is-enabled --quiet auditd
   audit_check "auditd active" systemctl is-active --quiet auditd
   local loaded; loaded=$(auditctl -l 2>/dev/null || true)

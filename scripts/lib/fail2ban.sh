@@ -51,7 +51,7 @@ apply_fail2ban() {
 
 audit_fail2ban() {
   command -v fail2ban-client >/dev/null 2>&1 || { audit_fail "fail2ban installed"; return 0; }
-  if [[ -f $F2B_JAIL && "$(cat "$F2B_JAIL")" == "$(f2b_render)" ]]; then audit_pass "$F2B_JAIL up to date"; else audit_fail "$F2B_JAIL up to date"; fi
+  audit_content "$F2B_JAIL" "$(f2b_render)"
   audit_check "fail2ban enabled" systemctl is-enabled --quiet fail2ban
   audit_check "fail2ban active" systemctl is-active --quiet fail2ban
   audit_check "sshd jail running" fail2ban-client status sshd

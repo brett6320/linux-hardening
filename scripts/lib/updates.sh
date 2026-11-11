@@ -166,7 +166,7 @@ apply_updates() {
 }
 
 _audit_file() { # path expected desc
-  if [[ -f $1 && "$(cat "$1")" == "$2" ]]; then audit_pass "${3:-$1} up to date"; else audit_fail "${3:-$1} up to date"; fi
+  audit_content "$1" "$2" "${3:-$1}"
 }
 
 audit_updates() {

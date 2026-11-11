@@ -315,8 +315,7 @@ audit_firewall() {
   if fw_ufw_active; then audit_na "ufw active; firewall not managed"; return 0; fi
   if [[ $OS_FAMILY == debian ]]; then
     command -v nft >/dev/null 2>&1 || { audit_fail "nftables installed"; return 0; }
-    if [[ -f $FW_NFT_FILE && "$(cat "$FW_NFT_FILE")" == "$(fw_render_nft)" ]]; then
-      audit_pass "$FW_NFT_FILE up to date"; else audit_fail "$FW_NFT_FILE up to date"; fi
+    audit_content "$FW_NFT_FILE" "$(fw_render_nft)" "" ordered
     audit_check "table inet hardening loaded" nft list table inet hardening
     audit_check "$FW_NFT_CONF includes /etc/nftables.d/*.nft" grep -qxF "$FW_NFT_INCLUDE" "$FW_NFT_CONF"
     audit_check "nftables.service enabled" systemctl is-enabled --quiet nftables
