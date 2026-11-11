@@ -1,0 +1,13 @@
+---
+# Read-only verification of every control (no changes are made).
+#   ansible-playbook verify.yml
+# Fails if any enabled control is not in place; N/A controls are reported as na.
+- name: Verify Linux hardening
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Verify controls
+      ansible.builtin.include_role:
+        name: hardening
+        tasks_from: verify.yml

@@ -1,0 +1,7 @@
+---
+profile: production
+offline: true
+skip_list:
+  # docs/SPEC.md mandates the shared "harden_*" variable names (mirroring the
+  # shell HARDEN_* settings); the role directory name "hardening" is also fixed.
+  - var-naming[no-role-prefix]

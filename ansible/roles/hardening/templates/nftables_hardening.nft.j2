@@ -1,0 +1,41 @@
+#!/usr/sbin/nft -f
+# Managed by linux-hardening (ansible role "hardening"). Local edits are overwritten.
+# Input filtering only: no "flush ruleset", no forward chain, so Docker,
+# Kubernetes and libvirt tables keep working.
+# Docker caveat: ports published with -p bypass INPUT; use DOCKER-USER or
+# bind them to 127.0.0.1.
+table inet hardening {}
+delete table inet hardening
+
+table inet hardening {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		ct state established,related accept
+		ct state invalid drop
+		iifname "lo" accept
+		icmp type echo-request limit rate 10/second burst 20 packets accept
+		icmp type echo-request drop
+		meta l4proto icmp accept
+		meta l4proto ipv6-icmp accept
+		udp sport 67 udp dport 68 accept
+		ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
+{% set v4 = harden_admin_sources | reject('search', ':') | list %}
+{% set v6 = harden_admin_sources | select('search', ':') | list %}
+{% if harden_admin_sources | length > 0 %}
+{% if v4 | length > 0 %}
+		ip saddr { {{ v4 | join(', ') }} } tcp dport {{ harden_ssh_port }} accept
+{% endif %}
+{% if v6 | length > 0 %}
+		ip6 saddr { {{ v6 | join(', ') }} } tcp dport {{ harden_ssh_port }} accept
+{% endif %}
+{% else %}
+		tcp dport {{ harden_ssh_port }} accept
+{% endif %}
+{% if harden_allowed_tcp_ports | length > 0 %}
+		tcp dport { {{ harden_allowed_tcp_ports | join(', ') }} } accept
+{% endif %}
+{% if harden_allowed_udp_ports | length > 0 %}
+		udp dport { {{ harden_allowed_udp_ports | join(', ') }} } accept
+{% endif %}
+	}
+}

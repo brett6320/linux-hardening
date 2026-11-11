@@ -13,6 +13,7 @@ RUN set -eux; \
       grp=wheel; \
     elif command -v zypper >/dev/null; then \
       zypper --non-interactive install systemd dbus-1 openssh-server iproute2 sudo python3 python3-pip procps kmod shadow; \
+      if zypper --non-interactive search -x python311 >/dev/null 2>&1; then zypper --non-interactive install python311 python311-pip python311-rpm || zypper --non-interactive install python311 python311-pip; fi; \
       grp=wheel; getent group wheel || groupadd wheel; \
     fi; \
     useradd -m -s /bin/bash -G "$grp" admin; \

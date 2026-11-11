@@ -1,0 +1,238 @@
+---
+# Revert one backup (mirrors "harden.sh --restore <timestamp>"): delete
+# created files, restore modified files/modes/unit states, reload services.
+- name: Restore | detect distribution
+  ansible.builtin.include_tasks: _family.yml
+
+- name: Restore | validate timestamp
+  ansible.builtin.assert:
+    that:
+      - harden_restore_timestamp | string | length > 0
+      - harden_restore_timestamp is match('^[0-9A-Za-z._-]+$')
+    fail_msg: Pass -e harden_restore_timestamp=<dir name under {{ harden_backup_root }}>.
+    quiet: true
+
+- name: Restore | set backup directory
+  ansible.builtin.set_fact:
+    harden_backup_dir: "{{ harden_backup_root }}/{{ harden_restore_timestamp }}"
+    harden_grp: restore
+
+- name: Restore | read manifest
+  ansible.builtin.slurp:
+    src: "{{ harden_backup_dir }}/manifest"
+  register: harden_rs_manifest
+
+- name: Restore | parse manifest (newest entry first)
+  ansible.builtin.set_fact:
+    harden_rs_entries: >-
+      {% set ns = namespace(out=[]) -%}
+      {% for l in (harden_rs_manifest.content | b64decode).splitlines() | map('trim') | reject('equalto', '') | reverse -%}
+      {% set f = l.split(' ') -%}
+      {% if f[0] in ['created', 'modified'] -%}
+      {% set ns.out = ns.out + [{'kind': f[0], 'path': f[1:] | join(' ')}] -%}
+      {% elif f[0] == 'mode' and f | length >= 5 -%}
+      {% set ns.out = ns.out + [{'kind': 'mode', 'mode': f[1], 'owner': f[2], 'group': f[3], 'path': f[4:] | join(' ')}] -%}
+      {% elif f[0] == 'unit' and f | length >= 4 -%}
+      {% set ns.out = ns.out + [{'kind': 'unit', 'unit': f[1], 'enabled': f[2], 'active': f[3], 'path': ''}] -%}
+      {% endif -%}
+      {% endfor -%}
+      {{ ns.out }}
+
+- name: Restore | read sshd port before restore
+  ansible.builtin.command:
+    argv: [/usr/sbin/sshd, -T]
+  environment:
+    PATH: /usr/sbin:/usr/bin:/sbin:/bin
+  register: harden_rs_sshd_before
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Restore | delete files created by hardening
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ harden_rs_entries | selectattr('kind', 'equalto', 'created') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Restore | restore modified files
+  ansible.builtin.copy:
+    src: "{{ harden_backup_dir ~ item.path }}"
+    dest: "{{ item.path }}"
+    remote_src: true
+    mode: preserve
+  loop: "{{ harden_rs_entries | selectattr('kind', 'equalto', 'modified') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Restore | restore modes
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    mode: "{{ item.mode }}"
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+  loop: "{{ harden_rs_entries | selectattr('kind', 'equalto', 'mode') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Restore | unmask units
+  ansible.builtin.systemd_service:
+    name: "{{ item.unit }}"
+    masked: false
+  loop: "{{ harden_rs_entries | selectattr('kind', 'equalto', 'unit') | rejectattr('enabled', 'equalto', 'masked') | list }}"
+  loop_control:
+    label: "{{ item.unit }}"
+
+- name: Restore | restore enablement
+  ansible.builtin.systemd_service:
+    name: "{{ item.unit }}"
+    enabled: "{{ item.enabled in ['enabled', 'enabled-runtime'] }}"
+  loop: >-
+    {{ harden_rs_entries | selectattr('kind', 'equalto', 'unit')
+       | selectattr('enabled', 'in', ['enabled', 'enabled-runtime', 'disabled']) | list }}
+  loop_control:
+    label: "{{ item.unit }}"
+
+- name: Restore | stop firewalld if it was not running before
+  ansible.builtin.systemd_service:
+    name: firewalld.service
+    state: stopped
+  loop: >-
+    {{ harden_rs_entries | selectattr('kind', 'equalto', 'unit') | selectattr('unit', 'equalto', 'firewalld.service')
+       | rejectattr('active', 'equalto', 'active') | list }}
+  loop_control:
+    label: "{{ item.unit }}"
+
+- name: Restore | reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: Restore | summarise touched areas
+  ansible.builtin.set_fact:
+    harden_rs_paths: "{{ harden_rs_entries | map(attribute='path') | list }}"
+
+- name: Restore | firewall (nftables)
+  when: harden_rs_paths | select('match', '^/etc/nftables') | list | length > 0
+  block:
+    - name: Restore | stat nftables rules file
+      ansible.builtin.stat:
+        path: /etc/nftables.d/hardening.nft
+      register: harden_rs_nft
+
+    - name: Restore | reload restored nftables rules file
+      ansible.builtin.command:
+        argv: [nft, -f, /etc/nftables.d/hardening.nft]
+      changed_when: true
+      when: harden_rs_nft.stat.exists
+
+    - name: Restore | delete hardening table
+      ansible.builtin.command:
+        argv: [nft, delete, table, inet, hardening]
+      register: harden_rs_nft_del
+      changed_when: harden_rs_nft_del.rc == 0
+      failed_when: false
+      when: not harden_rs_nft.stat.exists
+
+- name: Restore | firewall (firewalld)
+  when: harden_rs_paths | select('match', '^/etc/firewalld/') | list | length > 0
+  block:
+    - name: Restore | check firewalld
+      ansible.builtin.command:
+        argv: [firewall-cmd, --state]
+      register: harden_rs_fwd
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Restore | reload firewalld
+      ansible.builtin.command:
+        argv: [firewall-cmd, --reload]
+      changed_when: true
+      when: harden_rs_fwd.rc == 0
+
+- name: Restore | apply sysctl
+  ansible.builtin.command:
+    argv: [sysctl, --system]
+  changed_when: true
+  failed_when: false
+  when: harden_rs_paths | select('match', '^/etc/sysctl\.d/') | list | length > 0
+
+- name: Restore | reload audit rules
+  ansible.builtin.command:
+    argv: [augenrules, --load]
+  changed_when: true
+  failed_when: false
+  when: harden_rs_paths | select('match', '^/etc/audit/') | list | length > 0
+
+- name: Restore | restart services with restored configuration
+  ansible.builtin.systemd_service:
+    name: "{{ item.unit }}"
+    state: restarted
+  loop:
+    - {unit: fail2ban, re: '^/etc/fail2ban/'}
+    - {unit: systemd-journald, re: '^/etc/systemd/journald'}
+    - {unit: rsyslog, re: '^/etc/rsyslog'}
+  loop_control:
+    label: "{{ item.unit }}"
+  when: harden_rs_paths | select('match', item.re) | list | length > 0
+  failed_when: false
+
+- name: Restore | sshd
+  when: harden_rs_paths | select('match', '^/etc/ssh/') | list | length > 0
+  block:
+    - name: Restore | validate sshd configuration
+      ansible.builtin.command:
+        argv: [/usr/sbin/sshd, -t]
+      environment:
+        PATH: /usr/sbin:/usr/bin:/sbin:/bin
+      changed_when: false
+
+    - name: Restore | read restored sshd port
+      ansible.builtin.command:
+        argv: [/usr/sbin/sshd, -T]
+      environment:
+        PATH: /usr/sbin:/usr/bin:/sbin:/bin
+      register: harden_rs_sshd_after
+      changed_when: false
+      check_mode: false
+
+    - name: Restore | detect ssh.socket activation
+      ansible.builtin.command:
+        argv: [systemctl, is-enabled, ssh.socket]
+      register: harden_rs_sock
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Restore | compute sshd reload parameters
+      ansible.builtin.set_fact:
+        harden_ssh_socket: "{{ harden_family == 'debian' and (harden_rs_sock.stdout | default('') | trim) == 'enabled' }}"
+        harden_rs_port_after: >-
+          {{ harden_rs_sshd_after.stdout_lines | select('match', '^port ') | map('regex_replace', '^port ', '') | first | default('22') }}
+        harden_ssh_port_changed: >-
+          {{ (harden_rs_sshd_after.stdout_lines | select('match', '^port ') | list)
+             != (harden_rs_sshd_before.stdout_lines | default([]) | select('match', '^port ') | list) }}
+
+    - name: Restore | reload sshd
+      ansible.builtin.include_tasks: _ssh_reload.yml
+
+    - name: Restore | reconnect on restored port
+      when: harden_ssh_port_changed | bool and not ansible_check_mode
+      block:
+        - name: Restore | use restored port
+          ansible.builtin.set_fact:
+            ansible_port: "{{ harden_rs_port_after | int }}"
+            ansible_ssh_port: "{{ harden_rs_port_after | int }}"
+
+        - name: Restore | confirm connectivity with a new connection
+          ansible.builtin.include_tasks: _reconnect.yml
+          vars:
+            harden_rollback_seconds: 120
+
+- name: Restore | done
+  ansible.builtin.debug:
+    msg: >-
+      Restored {{ harden_rs_entries | length }} manifest entries from {{ harden_backup_dir }}.
+      SELinux/mount option changes take full effect after reboot; semanage port labels,
+      authselect features and installed/removed packages are not reverted.

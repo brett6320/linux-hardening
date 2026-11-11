@@ -1,0 +1,193 @@
+---
+# Control group: updates (SPEC "updates", automatic security updates).
+- name: Updates | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: updates
+
+- name: Updates | install update tooling
+  ansible.builtin.include_tasks: _pkgs.yml
+  vars:
+    harden_pkgs: "{{ harden_update_packages }}"
+
+# ---------------------------------------------------------------- debian
+- name: Updates | unattended-upgrades (debian)
+  when: harden_family == 'debian'
+  block:
+    - name: Updates | enable daily unattended-upgrades
+      ansible.builtin.include_tasks: _file.yml
+      vars:
+        harden_f:
+          path: /etc/apt/apt.conf.d/20auto-upgrades
+          content: |
+            // Managed by linux-hardening.
+            APT::Periodic::Update-Package-Lists "1";
+            APT::Periodic::Unattended-Upgrade "1";
+
+    - name: Updates | restrict unattended-upgrades to security origins
+      ansible.builtin.include_tasks: _file.yml
+      vars:
+        harden_f:
+          path: /etc/apt/apt.conf.d/52hardening-unattended
+          content: "{{ lookup('ansible.builtin.template', 'unattended-upgrades.j2') }}"
+
+# ---------------------------------------------------------------- rhel
+- name: Updates | dnf-automatic (rhel)
+  when: harden_family == 'rhel'
+  block:
+    - name: Updates | stat automatic.conf
+      ansible.builtin.stat:
+        path: /etc/dnf/automatic.conf
+      register: harden_up_conf
+
+    - name: Updates | create automatic.conf (dnf5 without /etc copy)
+      ansible.builtin.include_tasks: _file.yml
+      vars:
+        harden_f:
+          path: /etc/dnf/automatic.conf
+          content: |
+            # Managed by linux-hardening (overrides the packaged defaults).
+            [commands]
+            upgrade_type = {{ 'default' if harden_is_fedora | bool else 'security' }}
+            apply_updates = yes
+            reboot = {{ 'when-needed' if harden_auto_reboot | bool else 'never' }}
+      when: not harden_up_conf.stat.exists
+
+    - name: Updates | set automatic.conf [commands] options
+      ansible.builtin.include_tasks: _line.yml
+      vars:
+        harden_l:
+          path: /etc/dnf/automatic.conf
+          regexp: "^#?\\s*{{ harden_up_item.key }}\\s*="
+          line: "{{ harden_up_item.key }} = {{ harden_up_item.value }}"
+          insertafter: '^\[commands\]'
+      loop:
+        - {key: upgrade_type, value: "{{ 'default' if harden_is_fedora | bool else 'security' }}"}
+        - {key: apply_updates, value: "yes"}
+        - {key: reboot, value: "{{ 'when-needed' if harden_auto_reboot | bool else 'never' }}"}
+      loop_control:
+        loop_var: harden_up_item
+        label: "{{ harden_up_item.key }}"
+      when: harden_up_conf.stat.exists
+
+    - name: Updates | enable automatic update timer
+      ansible.builtin.systemd_service:
+        name: "{{ harden_dnf_automatic_timer }}"
+        enabled: true
+        state: started
+      register: harden_up_timer_rhel
+      ignore_errors: "{{ ansible_check_mode }}"
+
+# ---------------------------------------------------------------- suse
+- name: Updates | zypper security patch timer (suse)
+  when: harden_family == 'suse'
+  block:
+    - name: Updates | write hardening-autopatch units
+      ansible.builtin.include_tasks: _file.yml
+      vars:
+        harden_f: "{{ harden_up_unit }}"
+      loop:
+        - path: /etc/systemd/system/hardening-autopatch.service
+          content: |
+            # Managed by linux-hardening.
+            [Unit]
+            Description=linux-hardening: install security patches
+            Wants=network-online.target
+            After=network-online.target
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/bin/zypper --non-interactive patch --category security
+            # 102: reboot needed, 103: zypper updated itself (patch run again next time)
+            SuccessExitStatus=100 101 102 103
+        - path: /etc/systemd/system/hardening-autopatch.timer
+          content: |
+            # Managed by linux-hardening.
+            [Unit]
+            Description=linux-hardening: daily security patches
+
+            [Timer]
+            OnCalendar=daily
+            RandomizedDelaySec=1h
+            Persistent=true
+
+            [Install]
+            WantedBy=timers.target
+      loop_control:
+        loop_var: harden_up_unit
+        label: "{{ harden_up_unit.path }}"
+
+    - name: Updates | write hardening-autoreboot units
+      ansible.builtin.include_tasks: _file.yml
+      vars:
+        harden_f: "{{ harden_up_unit }}"
+      loop:
+        - path: /etc/systemd/system/hardening-autoreboot.service
+          content: |
+            # Managed by linux-hardening.
+            [Unit]
+            Description=linux-hardening: reboot if zypper needs-rebooting says so
+
+            [Service]
+            Type=oneshot
+            ExecStart=/bin/sh -c 'zypper needs-rebooting >/dev/null 2>&1; [ $$? -eq 102 ] && systemctl reboot || true'
+        - path: /etc/systemd/system/hardening-autoreboot.timer
+          content: |
+            # Managed by linux-hardening.
+            [Unit]
+            Description=linux-hardening: reboot window
+
+            [Timer]
+            OnCalendar=*-*-* {{ harden_auto_reboot_time }}:00
+
+            [Install]
+            WantedBy=timers.target
+      loop_control:
+        loop_var: harden_up_unit
+        label: "{{ harden_up_unit.path }}"
+      when: harden_auto_reboot | bool
+
+    - name: Updates | reload systemd after unit changes
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: harden_changed_files | select('match', '^/etc/systemd/system/hardening-auto') | list | length > 0
+
+    - name: Updates | enable patch timer
+      ansible.builtin.systemd_service:
+        name: hardening-autopatch.timer
+        enabled: true
+        state: started
+      register: harden_up_timer_suse
+      ignore_errors: "{{ ansible_check_mode }}"
+
+    - name: Updates | enable reboot timer
+      ansible.builtin.systemd_service:
+        name: hardening-autoreboot.timer
+        enabled: true
+        state: started
+      register: harden_up_reboot_suse
+      ignore_errors: "{{ ansible_check_mode }}"
+      when: harden_auto_reboot | bool
+
+    - name: Updates | check for reboot timer when auto-reboot is off
+      ansible.builtin.stat:
+        path: /etc/systemd/system/hardening-autoreboot.timer
+      register: harden_up_rb_stat
+      when: not harden_auto_reboot | bool
+
+    - name: Updates | disable reboot timer when auto-reboot is off
+      ansible.builtin.systemd_service:
+        name: hardening-autoreboot.timer
+        enabled: false
+        state: stopped
+      register: harden_up_reboot_off
+      when: not harden_auto_reboot | bool and harden_up_rb_stat.stat.exists
+
+- name: Updates | record group result
+  ansible.builtin.include_tasks: _record.yml
+  vars:
+    harden_rec_regs:
+      - "{{ harden_up_timer_rhel | default({}) }}"
+      - "{{ harden_up_timer_suse | default({}) }}"
+      - "{{ harden_up_reboot_suse | default({}) }}"
+      - "{{ harden_up_reboot_off | default({}) }}"

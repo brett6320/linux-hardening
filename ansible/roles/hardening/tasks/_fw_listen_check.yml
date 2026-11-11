@@ -1,0 +1,49 @@
+---
+# Internal: safety rule 2. Abort the firewall group if a non-loopback
+# listening socket uses a port that will not be allowed.
+- name: Firewall safety | list listening sockets
+  ansible.builtin.command:
+    argv: [ss, -Htulpn]
+  register: harden_fw_ss
+  changed_when: false
+  check_mode: false
+  tags: [always]
+
+- name: Firewall safety | find listening ports outside the allowlist
+  ansible.builtin.set_fact:
+    harden_fw_unallowed: >-
+      {% set ns = namespace(out=[]) -%}
+      {% set allow_tcp = ([harden_ssh_port] + harden_allowed_tcp_ports) | map('string') | list -%}
+      {% set allow_udp = (['68', '546'] + harden_allowed_udp_ports) | map('string') | list -%}
+      {% for line in harden_fw_ss.stdout_lines -%}
+      {% set f = line.split() -%}
+      {% if f | length >= 5 -%}
+      {% set addr = f[4] | regex_replace('^(.*):([^:]*)$', '\\1') | regex_replace('^\\[|\\]$', '') -%}
+      {% set port = f[4] | regex_replace('^(.*):([^:]*)$', '\\2') -%}
+      {% set loopback = addr is match('^(127\\.|::1$|::ffff:127\\.)') or addr is search('%lo$') -%}
+      {% if port is match('^[0-9]+$') and not loopback and (f[0] ~ '/' ~ port) not in harden_firewall_ignore_listeners -%}
+      {% if f[0] == 'tcp' and port not in allow_tcp -%}
+      {% set ns.out = ns.out + [port ~ '/tcp'] -%}
+      {% elif f[0] == 'udp' and port not in allow_udp -%}
+      {% set ns.out = ns.out + [port ~ '/udp'] -%}
+      {% endif -%}
+      {% endif -%}
+      {% endif -%}
+      {% endfor -%}
+      {{ ns.out | unique | list }}
+  tags: [always]
+
+- name: Firewall safety | abort group on unallowed listening ports
+  ansible.builtin.set_fact:
+    harden_grp_skip: >-
+      listening on ports not in the allowlist: {{ harden_fw_unallowed | join(', ') }}
+      (add them to harden_allowed_tcp_ports/harden_allowed_udp_ports or set harden_firewall_force=true)
+  when: harden_fw_unallowed | length > 0 and not harden_firewall_force | bool
+  tags: [always]
+
+- name: Firewall safety | warn about forced firewall
+  ansible.builtin.include_tasks: _warn.yml
+  vars:
+    harden_warn_msg: "harden_firewall_force=true: ports {{ harden_fw_unallowed | join(', ') }} become unreachable."
+  when: harden_fw_unallowed | length > 0 and harden_firewall_force | bool
+  tags: [always]

@@ -1,0 +1,183 @@
+---
+# Control group: accounts (SPEC "accounts").
+- name: Accounts | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: accounts
+
+# ---------------------------------------------------------------- login.defs
+- name: Accounts | stat login.defs locations
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop: [/etc/login.defs, /usr/etc/login.defs]
+  register: harden_acc_ld
+
+- name: Accounts | choose login.defs target
+  ansible.builtin.set_fact:
+    harden_acc_ld_dropin: "{{ not harden_acc_ld.results[0].stat.exists and harden_acc_ld.results[1].stat.exists }}"
+    harden_acc_ld_effective: "{{ '/etc/login.defs' if harden_acc_ld.results[0].stat.exists else '/usr/etc/login.defs' }}"
+
+- name: Accounts | read effective login.defs
+  ansible.builtin.slurp:
+    src: "{{ harden_acc_ld_effective }}"
+  register: harden_acc_ld_raw
+  when: harden_acc_ld.results[0].stat.exists or harden_acc_ld.results[1].stat.exists
+
+- name: Accounts | compute login.defs settings
+  ansible.builtin.set_fact:
+    harden_acc_ld_settings: >-
+      {% set cur = (harden_acc_ld_raw.content | default('') | b64decode)
+           | regex_findall('(?m)^\\s*ENCRYPT_METHOD\\s+(\\S+)') | last | default('') | upper -%}
+      {{ [{'key': 'PASS_MAX_DAYS', 'value': '365'}, {'key': 'PASS_MIN_DAYS', 'value': '1'},
+          {'key': 'PASS_WARN_AGE', 'value': '14'}, {'key': 'UMASK', 'value': '027'}]
+         + ([] if cur in ['YESCRYPT', 'SHA512'] else [{'key': 'ENCRYPT_METHOD', 'value': 'SHA512'}]) }}
+
+- name: Accounts | set login.defs values (/etc/login.defs)
+  ansible.builtin.include_tasks: _line.yml
+  vars:
+    harden_l:
+      path: /etc/login.defs
+      regexp: "^\\s*{{ harden_acc_item.key }}\\s"
+      line: "{{ harden_acc_item.key }}\t{{ harden_acc_item.value }}"
+  loop: "{{ harden_acc_ld_settings }}"
+  loop_control:
+    loop_var: harden_acc_item
+    label: "{{ harden_acc_item.key }}"
+  when: harden_acc_ld.results[0].stat.exists
+
+- name: Accounts | write login.defs drop-in (SUSE vendor /usr/etc layout)
+  ansible.builtin.include_tasks: _file.yml
+  vars:
+    harden_f:
+      path: /etc/login.defs.d/99-hardening.defs
+      content: |
+        # Managed by linux-hardening (ansible role "hardening"). Applies to new accounts only.
+        {% for e in harden_acc_ld_settings %}
+        {{ e.key }}	{{ e.value }}
+        {% endfor %}
+  when: harden_acc_ld_dropin | bool
+
+# ---------------------------------------------------------------- report-only
+- name: Accounts | read user database
+  ansible.builtin.getent:
+    database: passwd
+
+- name: Accounts | find suspicious accounts
+  ansible.builtin.set_fact:
+    harden_acc_uid0: >-
+      {{ ansible_facts['getent_passwd'] | dict2items | selectattr('value.1', 'equalto', '0')
+         | map(attribute='key') | reject('equalto', 'root') | list }}
+    harden_acc_syslogin: >-
+      {% set ns = namespace(out=[]) -%}
+      {% for u, f in ansible_facts['getent_passwd'].items()
+           if u != 'root' and (f[1] | int) > 0 and (f[1] | int) < 1000
+              and (f[5] | default('', true)) | length > 0
+              and not (f[5] is search('(nologin|/false|/sync|/shutdown|/halt)$')) -%}
+      {% set ns.out = ns.out + [u ~ ':' ~ f[5]] -%}
+      {% endfor -%}
+      {{ ns.out }}
+
+- name: Accounts | warn about extra UID 0 accounts
+  ansible.builtin.include_tasks: _warn.yml
+  vars:
+    harden_warn_msg: "UID 0 accounts other than root: {{ harden_acc_uid0 | join(', ') }}"
+  when: harden_acc_uid0 | length > 0
+
+- name: Accounts | warn about system accounts with login shells
+  ansible.builtin.include_tasks: _warn.yml
+  vars:
+    harden_warn_msg: "system accounts with login shells: {{ harden_acc_syslogin | join(', ') }}"
+  when: harden_acc_syslogin | length > 0
+
+# ---------------------------------------------------------------- faillock (rhel)
+- name: Accounts | faillock (rhel only)
+  when: harden_family == 'rhel'
+  block:
+    - name: Accounts | set faillock.conf values
+      ansible.builtin.include_tasks: _line.yml
+      vars:
+        harden_l:
+          path: /etc/security/faillock.conf
+          regexp: "^\\s*#?\\s*{{ harden_acc_item.key }}\\s*="
+          line: "{{ harden_acc_item.key }} = {{ harden_acc_item.value }}"
+          create: true
+          mode: "0644"
+      loop:
+        - {key: deny, value: "5"}
+        - {key: unlock_time, value: "900"}
+        - {key: fail_interval, value: "900"}
+      loop_control:
+        loop_var: harden_acc_item
+        label: "{{ harden_acc_item.key }}"
+
+    - name: Accounts | read authselect state
+      ansible.builtin.command:
+        argv: [authselect, current]
+      register: harden_acc_authselect
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Accounts | enable authselect with-faillock
+      ansible.builtin.command:
+        argv: [authselect, enable-feature, with-faillock]
+      register: harden_acc_authselect_fl
+      changed_when: true
+      when:
+        - harden_acc_authselect.rc == 0
+        - not (harden_acc_authselect.stdout is search('(?m)^-\s*with-faillock\s*$'))
+
+# ---------------------------------------------------------------- limits / coredump / sudo
+- name: Accounts | disable core dumps (limits)
+  ansible.builtin.include_tasks: _file.yml
+  vars:
+    harden_f:
+      path: /etc/security/limits.d/99-hardening.conf
+      content: |
+        # Managed by linux-hardening (ansible role "hardening").
+        * hard core 0
+
+- name: Accounts | disable core dumps (systemd-coredump)
+  ansible.builtin.include_tasks: _file.yml
+  vars:
+    harden_f:
+      path: /etc/systemd/coredump.conf.d/99-hardening.conf
+      content: |
+        # Managed by linux-hardening (ansible role "hardening").
+        [Coredump]
+        Storage=none
+        ProcessSizeMax=0
+
+- name: Accounts | sudo defaults
+  ansible.builtin.include_tasks: _file.yml
+  vars:
+    harden_f:
+      path: /etc/sudoers.d/99-hardening
+      mode: "0440"
+      validate: /usr/sbin/visudo -cf %s
+      content: |
+        # Managed by linux-hardening (ansible role "hardening").
+        Defaults use_pty
+        Defaults logfile="/var/log/sudo.log"
+        Defaults timestamp_timeout=5
+
+- name: Accounts | rotate sudo log
+  ansible.builtin.include_tasks: _file.yml
+  vars:
+    harden_f:
+      path: /etc/logrotate.d/hardening-sudo
+      content: |
+        # Managed by linux-hardening (ansible role "hardening").
+        /var/log/sudo.log {
+            weekly
+            rotate 12
+            compress
+            missingok
+        }
+
+- name: Accounts | record group result
+  ansible.builtin.include_tasks: _record.yml
+  vars:
+    harden_rec_regs:
+      - "{{ harden_acc_authselect_fl | default({}) }}"

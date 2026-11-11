@@ -1,0 +1,147 @@
+---
+# Control group: auditd (SPEC "auditd").
+- name: Auditd | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: auditd
+
+- name: Auditd | skip when auditd is not installed
+  ansible.builtin.set_fact:
+    harden_grp_skip: "{{ harden_auditd_package }} is not installed"
+  when: harden_auditd_package not in ansible_facts['packages']
+
+- name: Auditd | configure rules
+  when: harden_grp_skip | length == 0
+  block:
+    - name: Auditd | read rule source
+      ansible.builtin.set_fact:
+        harden_audit_src: >-
+          {{ lookup('ansible.builtin.file', harden_data_dir ~ '/audit.rules').splitlines() | map('trim') | list }}
+
+    - name: Auditd | find watch paths that exist (path, or parent for files)
+      ansible.builtin.command:
+        argv: >-
+          {{ ['sh', '-c',
+              'for p do case "$p" in */) [ -e "$p" ] && echo "$p";; *) { [ -e "$p" ] || [ -d "$(dirname "$p")" ]; } && echo "$p";; esac; done; exit 0',
+              'sh']
+             + (harden_audit_src | select('match', '^-w\s') | map('regex_replace', '^-w\s+(\S+).*$', '\1') | list) }}
+      register: harden_audit_paths
+      changed_when: false
+      check_mode: false
+
+    - name: Auditd | render rules
+      ansible.builtin.set_fact:
+        harden_audit_content: |
+          ## Managed by linux-hardening (ansible role "hardening"). Local edits are overwritten.
+          ## Source: data/audit.rules
+          {% for l in harden_audit_src %}
+          {% set l = l | replace('auid!=unset', 'auid!=4294967295') %}
+          {% if l is match('^-w\\s') %}
+          {% if (l | regex_replace('^-w\\s+(\\S+).*$', '\\1')) in harden_audit_paths.stdout_lines %}
+          {{ l }}
+          {% endif %}
+          {% elif 'ARCH' in l and not l is match('#') %}
+          {{ l | replace('ARCH', 'b64') }}
+          {% if ansible_facts['architecture'] == 'x86_64' %}
+          {{ l | replace('ARCH', 'b32') }}
+          {% endif %}
+          {% else %}
+          {{ l }}
+          {% endif %}
+          {% endfor %}
+          {% if harden_audit_immutable | bool %}
+          -e 2
+          {% endif %}
+
+    - name: Auditd | find rules files with "-a task,never"
+      ansible.builtin.find:
+        paths: /etc/audit/rules.d
+        patterns: "*.rules"
+        contains: '^-a\s+(task,never|never,task)'
+        excludes: 99-hardening.rules
+      register: harden_audit_never
+
+    - name: Auditd | warn about disabled syscall auditing
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: >-
+          {{ harden_audit_never.files | map(attribute='path') | join(', ') }} contains "-a task,never": syscall rules are disabled
+          {{ '(commented out because harden_audit_fix_task_never=true)' if harden_audit_fix_task_never | bool
+             else '(set harden_audit_fix_task_never=true to comment it out)' }}
+      when: harden_audit_never.files | length > 0
+
+    - name: Auditd | comment out "-a task,never"
+      ansible.builtin.include_tasks: _line.yml
+      vars:
+        harden_l:
+          path: "{{ harden_audit_never_item.path }}"
+          regexp: '^(-a\s+(task,never|never,task).*)$'
+          line: '## \1    # disabled by linux-hardening'
+          backrefs: true
+      loop: "{{ harden_audit_never.files }}"
+      loop_control:
+        loop_var: harden_audit_never_item
+        label: "{{ harden_audit_never_item.path }}"
+      when: harden_audit_fix_task_never | bool
+
+    - name: Auditd | write /etc/audit/rules.d/99-hardening.rules
+      ansible.builtin.include_tasks: _file.yml
+      vars:
+        harden_f:
+          path: /etc/audit/rules.d/99-hardening.rules
+          content: "{{ harden_audit_content }}"
+          mode: "0600"
+
+    - name: Auditd | enable and start auditd
+      block:
+        - name: Auditd | enable and start auditd service
+          ansible.builtin.systemd_service:
+            name: auditd
+            enabled: true
+            state: started
+          register: harden_audit_svc
+      rescue:
+        - name: Auditd | warn when auditd cannot start (e.g. container)
+          ansible.builtin.include_tasks: _warn.yml
+          vars:
+            harden_warn_msg: "auditd could not be started: {{ ansible_failed_result.msg | default('') }}"
+
+    - name: Auditd | load rules
+      ansible.builtin.command:
+        argv: [augenrules, --load]
+      register: harden_audit_load
+      changed_when: true
+      failed_when: false
+      when: harden_changed_files | select('match', '^/etc/audit/rules\.d/') | list | length > 0
+
+    - name: Auditd | check loaded rule state
+      ansible.builtin.command:
+        argv: [auditctl, -s]
+      register: harden_audit_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: harden_audit_load is not skipped
+
+    - name: Auditd | warn when rules could not be loaded (immutable)
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: >-
+          augenrules --load did not load the new rules (rc={{ harden_audit_load.rc }}; loaded rules are
+          probably immutable "-e 2"); they take effect after reboot.
+      when:
+        - harden_audit_load is not skipped
+        - harden_audit_load.rc != 0 or (harden_audit_status.stdout | default('')) is search('enabled 2')
+
+    - name: Auditd | flag reboot for immutable rules
+      ansible.builtin.set_fact:
+        harden_reboot_reasons: "{{ harden_reboot_reasons + ['audit rules immutable, new rules load at boot'] }}"
+      when:
+        - harden_audit_load is not skipped
+        - harden_audit_load.rc != 0 or (harden_audit_status.stdout | default('')) is search('enabled 2')
+
+- name: Auditd | record group result
+  ansible.builtin.include_tasks: _record.yml
+  vars:
+    harden_rec_regs:
+      - "{{ harden_audit_svc | default({}) }}"

@@ -1,0 +1,228 @@
+---
+# Control group: packages (SPEC "packages").
+- name: Packages | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: packages
+
+- name: Packages | initialise fail2ban availability
+  ansible.builtin.set_fact:
+    harden_fail2ban_unavailable: ""
+
+# ---------------------------------------------------------------- metadata
+- name: Packages | refresh metadata (apt)
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  changed_when: false
+  when: harden_family == 'debian'
+
+- name: Packages | refresh metadata (dnf)
+  ansible.builtin.command:
+    argv: [dnf, -q, makecache]
+  changed_when: false
+  when: harden_family == 'rhel'
+
+- name: Packages | refresh metadata (zypper)
+  ansible.builtin.command:
+    argv: [zypper, --non-interactive, --quiet, refresh]
+  changed_when: false
+  when: harden_family == 'suse'
+
+# ---------------------------------------------------------------- EPEL (rhel, not Fedora)
+- name: Packages | query EPEL release package
+  ansible.builtin.command:
+    argv: [rpm, -q, epel-release]
+  register: harden_pk_epel_q
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: harden_family == 'rhel' and not harden_is_fedora | bool
+
+- name: Packages | enable EPEL and CRB for fail2ban
+  when: harden_family == 'rhel' and not harden_is_fedora | bool
+  block:
+    - name: Packages | install epel-release (Rocky/Alma/CentOS)
+      ansible.builtin.package:
+        name: epel-release
+        state: present
+      register: harden_pk_epel_inst
+      when: not harden_is_rhel_proper | bool and harden_pk_epel_q.rc != 0
+
+    - name: Packages | install epel-release from dl.fedoraproject.org (RHEL)
+      ansible.builtin.dnf:
+        name: "https://dl.fedoraproject.org/pub/epel/epel-release-latest-{{ harden_os_major }}.noarch.rpm"
+        state: present
+        disable_gpg_check: true
+      register: harden_pk_epel_url
+      when: harden_is_rhel_proper | bool and harden_pk_epel_q.rc != 0
+
+    - name: Packages | list enabled repositories
+      ansible.builtin.command:
+        argv: [dnf, -q, repolist, --enabled]
+      register: harden_pk_repos
+      changed_when: false
+      check_mode: false
+
+    - name: Packages | enable CRB (Rocky/Alma/CentOS)
+      ansible.builtin.command:
+        argv: [dnf, config-manager, --set-enabled, crb]
+      changed_when: true
+      register: harden_pk_crb
+      when:
+        - not harden_is_rhel_proper | bool
+        - harden_pk_repos.stdout_lines | select('match', '^crb\s') | list | length == 0
+
+    - name: Packages | enable CodeReady Builder (RHEL)
+      ansible.builtin.command:
+        argv:
+          - subscription-manager
+          - repos
+          - "--enable=codeready-builder-for-rhel-{{ harden_os_major }}-{{ ansible_facts['architecture'] }}-rpms"
+      changed_when: true
+      register: harden_pk_crb_rhel
+      when:
+        - harden_is_rhel_proper | bool
+        - harden_pk_repos.stdout_lines | select('match', '^codeready-builder') | list | length == 0
+  rescue:
+    - name: Packages | mark fail2ban unavailable (EPEL/CRB failed)
+      ansible.builtin.set_fact:
+        harden_fail2ban_unavailable: >-
+          EPEL/CRB could not be enabled ({{ ansible_failed_task.name | default('') }}:
+          {{ (ansible_failed_result.stderr | default('') or ansible_failed_result.msg | default('')) | trim }})
+
+# ---------------------------------------------------------------- SLES PackageHub
+- name: Packages | check fail2ban availability (suse)
+  ansible.builtin.command:
+    argv: [zypper, --non-interactive, --quiet, search, --match-exact, fail2ban]
+  register: harden_pk_f2b_avail
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: harden_family == 'suse'
+
+- name: Packages | activate PackageHub (SLES)
+  ansible.builtin.command:
+    argv:
+      - SUSEConnect
+      - -p
+      - "PackageHub/{{ ansible_facts['distribution_version'] }}/{{ ansible_facts['architecture'] }}"
+  register: harden_pk_phub
+  changed_when: harden_pk_phub.rc == 0
+  failed_when: false
+  when: harden_family == 'suse' and harden_is_sles | bool and harden_pk_f2b_avail.rc != 0
+
+- name: Packages | re-check fail2ban availability (SLES)
+  ansible.builtin.command:
+    argv: [zypper, --non-interactive, --quiet, search, --match-exact, fail2ban]
+  register: harden_pk_f2b_avail2
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: harden_family == 'suse' and harden_is_sles | bool and harden_pk_f2b_avail.rc != 0
+
+- name: Packages | mark fail2ban unavailable (suse)
+  ansible.builtin.set_fact:
+    harden_fail2ban_unavailable: "fail2ban not available{{ ' (PackageHub could not be enabled)' if harden_is_sles | bool else '' }}"
+  when:
+    - harden_family == 'suse'
+    - harden_pk_f2b_avail.rc != 0
+    - harden_pk_f2b_avail2.rc | default(1) != 0
+
+- name: Packages | warn when fail2ban is unavailable
+  ansible.builtin.include_tasks: _warn.yml
+  vars:
+    harden_warn_msg: "{{ harden_fail2ban_unavailable }}; skipping fail2ban."
+  when: harden_fail2ban_unavailable | length > 0
+
+# ---------------------------------------------------------------- updates
+- name: Packages | apply pending updates (apt)
+  ansible.builtin.apt:
+    upgrade: dist
+  register: harden_pk_upg_apt
+  when: harden_apply_updates | bool and harden_family == 'debian'
+
+- name: Packages | check for pending updates (dnf)
+  ansible.builtin.command:
+    argv: [dnf, -q, check-update]
+  register: harden_pk_dnf_cu
+  changed_when: false
+  failed_when: harden_pk_dnf_cu.rc not in [0, 100]
+  check_mode: false
+  when: harden_apply_updates | bool and harden_family == 'rhel'
+
+- name: Packages | apply pending updates (dnf)
+  ansible.builtin.command:
+    argv: [dnf, -y, upgrade]
+  register: harden_pk_upg_dnf
+  changed_when: true
+  when: harden_apply_updates | bool and harden_family == 'rhel' and harden_pk_dnf_cu.rc | default(0) == 100
+
+- name: Packages | list pending updates (zypper)
+  ansible.builtin.command:
+    argv: [zypper, --non-interactive, --quiet, list-updates]
+  register: harden_pk_zlu
+  changed_when: false
+  check_mode: false
+  when: harden_apply_updates | bool and harden_family == 'suse'
+
+- name: Packages | apply pending updates (zypper)
+  ansible.builtin.command:
+    argv: [zypper, --non-interactive, update]
+  register: harden_pk_upg_zypper
+  changed_when: true
+  when:
+    - harden_apply_updates | bool
+    - harden_family == 'suse'
+    - harden_pk_zlu.stdout_lines | default([]) | select('match', '^v\s') | list | length > 0
+
+# ---------------------------------------------------------------- install / remove
+- name: Packages | install base packages
+  ansible.builtin.include_tasks: _pkgs.yml
+  vars:
+    harden_pkgs: "{{ harden_base_packages + harden_update_packages }}"
+
+- name: Packages | install fail2ban
+  when: harden_fail2ban_unavailable | length == 0
+  block:
+    - name: Packages | install fail2ban packages
+      ansible.builtin.include_tasks: _pkgs.yml
+      vars:
+        harden_pkgs: "{{ harden_fail2ban_packages }}"
+  rescue:
+    - name: Packages | mark fail2ban unavailable (install failed)
+      ansible.builtin.set_fact:
+        harden_fail2ban_unavailable: "fail2ban installation failed"
+
+    - name: Packages | warn about failed fail2ban installation
+      ansible.builtin.include_tasks: _warn.yml
+      vars:
+        harden_warn_msg: "fail2ban installation failed; skipping fail2ban."
+
+- name: Packages | remove unwanted packages that are installed
+  ansible.builtin.include_tasks: _pkgs.yml
+  vars:
+    harden_pkgs: >-
+      {{ lookup('ansible.builtin.file', harden_data_dir ~ '/remove-packages.list').splitlines()
+         | map('trim') | reject('match', '^(#|$)')
+         | select('match', '^' ~ harden_family ~ ':')
+         | map('regex_replace', '^[^:]+:', '')
+         | select('in', ansible_facts['packages']) | list }}
+    harden_pkgs_state: absent
+
+- name: Packages | refresh package facts
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Packages | record group result
+  ansible.builtin.include_tasks: _record.yml
+  vars:
+    harden_rec_regs:
+      - "{{ harden_pk_upg_apt | default({}) }}"
+      - "{{ harden_pk_upg_dnf | default({}) }}"
+      - "{{ harden_pk_upg_zypper | default({}) }}"
+      - "{{ harden_pk_epel_inst | default({}) }}"
+      - "{{ harden_pk_epel_url | default({}) }}"
+      - "{{ harden_pk_crb | default({}) }}"
+      - "{{ harden_pk_crb_rhel | default({}) }}"
+      - "{{ harden_pk_phub | default({}) }}"

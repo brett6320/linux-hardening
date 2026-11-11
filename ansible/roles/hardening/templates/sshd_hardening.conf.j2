@@ -1,0 +1,42 @@
+# Managed by linux-hardening (ansible role "hardening"). Local edits are overwritten.
+# linux-hardening sshd drop-in. sshd is first-match-wins, so this file must
+# sort before 50-cloud-init.conf / 50-redhat.conf.
+Port {{ harden_ssh_port }}
+{% if harden_ssh_root_login == 'deny' %}
+PermitRootLogin no
+{% elif harden_ssh_root_login == 'keys' %}
+PermitRootLogin prohibit-password
+{% endif %}
+{% if harden_ssh_key_only | bool %}
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+{% endif %}
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+MaxAuthTries 3
+MaxSessions 4
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+PermitTunnel no
+PermitUserEnvironment no
+UseDNS no
+LogLevel VERBOSE
+Banner /etc/issue.net
+HostbasedAuthentication no
+IgnoreRhosts yes
+{% if harden_ssh_allow_users | length > 0 %}
+AllowUsers {{ harden_ssh_allow_users | join(' ') }}
+{% endif %}
+{% if harden_ssh_kex | length > 0 %}
+KexAlgorithms {{ harden_ssh_kex | join(',') }}
+{% endif %}
+{% if harden_ssh_ciphers | length > 0 %}
+Ciphers {{ harden_ssh_ciphers | join(',') }}
+{% endif %}
+{% if harden_ssh_macs | length > 0 %}
+MACs {{ harden_ssh_macs | join(',') }}
+{% endif %}

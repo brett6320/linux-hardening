@@ -1,0 +1,194 @@
+---
+# Read-only verification of every control (SPEC "Verify mode").
+# Results: pass / fail / warn / na. The play fails if any check is "fail".
+# Disabled groups (harden_<group>: false) are reported as na.
+- name: Verify | detect distribution
+  ansible.builtin.include_tasks: _family.yml
+
+- name: Verify | prepare
+  ansible.builtin.set_fact:
+    harden_v_units: >-
+      {{ lookup('ansible.builtin.file', harden_data_dir ~ '/services.list').splitlines()
+         | map('trim') | reject('match', '^(#|$)') | list }}
+    harden_v_sysctl: >-
+      {% set ns = namespace(out=[]) -%}
+      {% for l in lookup('ansible.builtin.file', harden_data_dir ~ '/sysctl.conf').splitlines() | map('trim')
+           if l | length > 0 and not l is match('^[#;]') and '=' in l -%}
+      {% set ns.out = ns.out + [[l.split('=', 1)[0] | trim, l.split('=', 1)[1] | trim]] -%}
+      {% endfor -%}
+      {% if harden_kexec_disable | bool %}{% set ns.out = ns.out + [['kernel.kexec_load_disabled', '1']] %}{% endif -%}
+      {% if harden_ipv6_accept_ra_off | bool -%}
+      {% set ns.out = ns.out + [['net.ipv6.conf.all.accept_ra', '0'], ['net.ipv6.conf.default.accept_ra', '0']] -%}
+      {% endif -%}
+      {% if harden_disable_ipv6 | bool -%}
+      {% set ns.out = ns.out + [['net.ipv6.conf.all.disable_ipv6', '1'], ['net.ipv6.conf.default.disable_ipv6', '1']] -%}
+      {% endif -%}
+      {{ ns.out }}
+    harden_v_modules: >-
+      {{ lookup('ansible.builtin.file', harden_data_dir ~ '/modules.list').splitlines()
+         | map('trim') | reject('match', '^(#|$)') | list }}
+    harden_v_remove: >-
+      {{ lookup('ansible.builtin.file', harden_data_dir ~ '/remove-packages.list').splitlines()
+         | map('trim') | reject('match', '^(#|$)') | select('match', '^' ~ harden_family ~ ':')
+         | map('regex_replace', '^[^:]+:', '') | list }}
+    harden_v_banner: "{{ lookup('ansible.builtin.file', harden_data_dir ~ '/issue.net') | trim }}"
+
+- name: Verify | run read-only probes
+  ansible.builtin.command:
+    argv: "{{ item.value }}"
+  environment:
+    PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  loop: "{{ harden_v_cmds | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  vars:
+    harden_v_cmds:
+      sshd: [/usr/sbin/sshd, -T]
+      ufw: [ufw, status]
+      nft: [nft, list, chain, inet, hardening, input]
+      fwd_default: [firewall-cmd, --get-default-zone]
+      fwd_ports: [firewall-cmd, --permanent, --zone=drop, --list-ports]
+      fwd_services: [firewall-cmd, --permanent, --zone=drop, --list-services]
+      fwd_protocols: [firewall-cmd, --permanent, --zone=drop, --list-protocols]
+      fwd_rich: [firewall-cmd, --permanent, --zone=drop, --list-rich-rules]
+      units: >-
+        {{ ['systemctl', 'show', '-p', 'Id', '-p', 'LoadState', '-p', 'ActiveState', '-p', 'UnitFileState', '--']
+           + harden_v_units
+           + ['ctrl-alt-del.target', harden_chrony_service ~ '.service', 'nftables.service', 'firewalld.service',
+              'fail2ban.service', 'auditd.service', 'apparmor.service', 'hardening-autopatch.timer',
+              (harden_dnf_automatic_timer | default('dnf-automatic.timer'))] }}
+      f2b: [fail2ban-client, status, sshd]
+      auditctl: [auditctl, -l]
+      tmp_unit: [systemctl, is-active, tmp.mount]
+      getenforce: [getenforce]
+      aa: [aa-enabled]
+      cryptopol: [update-crypto-policies, --show]
+      sysctl: >-
+        {{ ['sh', '-c', harden_v_sysctl_sh, 'sh'] + (harden_v_sysctl | map('first') | list) }}
+    harden_v_sysctl_sh: >-
+      for k do p=/proc/sys/$(printf %s "$k" | tr ./ /.);
+      [ -e "$p" ] && printf "%s=%s\n" "$k" "$(tr -s " \t" "  " < "$p")"; done; exit 0
+  register: harden_v_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Verify | read configuration files
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop:
+    - /etc/login.defs
+    - /usr/etc/login.defs
+    - /etc/login.defs.d/99-hardening.defs
+    - /etc/security/faillock.conf
+    - /etc/modprobe.d/00-hardening.conf
+    - /etc/issue
+    - /etc/issue.net
+    - /etc/nftables.conf
+    - /etc/dnf/automatic.conf
+    - /etc/apt/apt.conf.d/20auto-upgrades
+    - /etc/systemd/journald.conf.d/99-hardening.conf
+    - /etc/fail2ban/jail.d/99-hardening.local
+    - /etc/audit/rules.d/99-hardening.rules
+    - /etc/sysctl.d/99-hardening.conf
+    - /proc/self/mounts
+  register: harden_v_slurp
+  failed_when: false
+
+- name: Verify | find SSH host keys
+  ansible.builtin.find:
+    paths: /etc/ssh
+    patterns: ["ssh_host_*_key", "ssh_host_*_key.pub"]
+  register: harden_v_hostkeys
+
+- name: Verify | stat files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop:
+    - /etc/shadow
+    - /etc/gshadow
+    - /etc/passwd
+    - /etc/group
+    - /etc/crontab
+    - /etc/cron.d
+    - /etc/cron.daily
+    - /etc/cron.hourly
+    - /etc/cron.weekly
+    - /etc/cron.monthly
+    - /boot/grub/grub.cfg
+    - /boot/grub2/grub.cfg
+    - /etc/ssh/sshd_config.d/00-hardening.conf
+    - /etc/security/limits.d/99-hardening.conf
+    - /etc/systemd/coredump.conf.d/99-hardening.conf
+    - /etc/sudoers.d/99-hardening
+    - /etc/logrotate.d/hardening-sudo
+    - /etc/apt/apt.conf.d/52hardening-unattended
+    - /etc/rsyslog.d/99-hardening.conf
+    - /etc/nftables.d/hardening.nft
+    - /etc/selinux/config
+  register: harden_v_stat
+
+- name: Verify | index probe results
+  ansible.builtin.set_fact:
+    harden_v_p: >-
+      {{ dict(harden_v_probe.results | map(attribute='item.key')
+              | zip(harden_v_probe.results)) }}
+    harden_v_f: >-
+      {% set ns = namespace(d={}) -%}
+      {% for r in harden_v_slurp.results if r.content is defined -%}
+      {% set ns.d = ns.d | combine({r.item: r.content | b64decode}) -%}
+      {% endfor -%}
+      {{ ns.d }}
+    harden_v_s: >-
+      {{ dict(harden_v_stat.results | map(attribute='item') | zip(harden_v_stat.results | map(attribute='stat'))) }}
+
+- name: Verify | parse probe results
+  ansible.builtin.set_fact:
+    harden_v_sshd: >-
+      {{ dict(harden_v_p.sshd.stdout_lines | default([]) | map('regex_replace', '^(\S+).*$', '\1')
+              | zip(harden_v_p.sshd.stdout_lines | default([]) | map('regex_replace', '^\S+\s*', ''))) }}
+    harden_v_unit: >-
+      {% set ns = namespace(out={}, cur={}) -%}
+      {% for ln in harden_v_p.units.stdout_lines | default([]) + [''] -%}
+      {% if '=' in ln -%}
+      {% set ns.cur = ns.cur | combine({ln.split('=', 1)[0]: ln.split('=', 1)[1]}) -%}
+      {% elif ns.cur | length > 0 -%}
+      {% set ns.out = ns.out | combine({ns.cur.Id | default('?'): ns.cur}) -%}
+      {% set ns.cur = {} -%}
+      {% endif -%}
+      {% endfor -%}
+      {{ ns.out }}
+    harden_v_sysctl_now: >-
+      {{ dict(harden_v_p.sysctl.stdout_lines | default([]) | map('regex_replace', '=.*$', '')
+              | zip(harden_v_p.sysctl.stdout_lines | default([]) | map('regex_replace', '^[^=]*=', '') | map('trim'))) }}
+    harden_v_ufw_active: "{{ (harden_v_p.ufw.stdout | default('')) is search('Status: active') }}"
+    harden_v_logindefs: >-
+      {{ (harden_v_f['/etc/login.defs'] | default(harden_v_f['/usr/etc/login.defs'] | default(''))).splitlines()
+         + (harden_v_f['/etc/login.defs.d/99-hardening.defs'] | default('')).splitlines() }}
+    harden_v_selinux: >-
+      {{ harden_family == 'rhel' or (harden_family == 'suse' and harden_v_s['/etc/selinux/config'].exists) }}
+
+- name: Verify | evaluate checks
+  ansible.builtin.set_fact:
+    harden_v_results: "{{ lookup('ansible.builtin.template', 'verify_checks.j2') | from_json }}"
+
+- name: Verify | results
+  ansible.builtin.debug:
+    msg: >-
+      {{ harden_v_results | map(attribute='line') | list }}
+
+- name: Verify | totals
+  ansible.builtin.debug:
+    msg: >-
+      pass={{ harden_v_results | selectattr('r', 'equalto', 'pass') | list | length }}
+      fail={{ harden_v_results | selectattr('r', 'equalto', 'fail') | list | length }}
+      warn={{ harden_v_results | selectattr('r', 'equalto', 'warn') | list | length }}
+      na={{ harden_v_results | selectattr('r', 'equalto', 'na') | list | length }}
+
+- name: Verify | fail when a control is not in place
+  ansible.builtin.assert:
+    that: harden_v_results | selectattr('r', 'equalto', 'fail') | list | length == 0
+    fail_msg: >-
+      Controls not in place: {{ harden_v_results | selectattr('r', 'equalto', 'fail') | map(attribute='c') | join(', ') }}
+    quiet: true

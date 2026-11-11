@@ -1,0 +1,12 @@
+---
+# Apply the hardening role.
+#   ansible-playbook site.yml                      # apply
+#   ansible-playbook site.yml --check --diff       # dry-run
+#   ansible-playbook site.yml --tags ssh,firewall  # selected groups
+#   ansible-playbook site.yml -e harden_firewall=false
+- name: Harden Linux hosts
+  hosts: all
+  become: true
+  gather_facts: true
+  roles:
+    - role: hardening

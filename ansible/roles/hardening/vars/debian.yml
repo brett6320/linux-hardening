@@ -1,0 +1,22 @@
+---
+# Debian / Ubuntu specifics.
+harden_ssh_service: ssh
+harden_chrony_service: chrony
+harden_auditd_package: auditd
+harden_firewall_backend: nftables
+harden_fail2ban_banaction: nftables-multiport
+# Installed by the packages group (fail2ban handled separately).
+harden_base_packages:
+  - auditd
+  - chrony
+  - nftables
+  - unattended-upgrades
+  - needrestart
+harden_fail2ban_packages:
+  - fail2ban
+  - python3-systemd
+harden_update_packages:
+  - unattended-upgrades
+harden_apparmor_packages:
+  - apparmor
+  - apparmor-utils

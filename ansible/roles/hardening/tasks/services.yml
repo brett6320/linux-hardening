@@ -1,0 +1,134 @@
+---
+# Control group: services (SPEC "services"). Running services are never stopped.
+- name: Services | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: services
+
+- name: Services | read unit list
+  ansible.builtin.set_fact:
+    harden_svc_units: >-
+      {{ lookup('ansible.builtin.file', harden_data_dir ~ '/services.list').splitlines()
+         | map('trim') | reject('match', '^(#|$)') | list }}
+
+- name: Services | query unit states
+  ansible.builtin.command:
+    argv: >-
+      {{ ['systemctl', 'show', '-p', 'Id', '-p', 'LoadState', '-p', 'ActiveState', '-p', 'UnitFileState', '--']
+         + harden_svc_units + ['ctrl-alt-del.target', harden_chrony_service ~ '.service'] }}
+  register: harden_svc_show
+  changed_when: false
+  check_mode: false
+
+- name: Services | parse unit states
+  ansible.builtin.set_fact:
+    harden_svc_state: >-
+      {% set ns = namespace(out=[], cur={}) -%}
+      {% for ln in harden_svc_show.stdout_lines + [''] -%}
+      {% if '=' in ln -%}
+      {% set ns.cur = ns.cur | combine({ln.split('=', 1)[0]: ln.split('=', 1)[1]}) -%}
+      {% elif ns.cur | length > 0 -%}
+      {% set ns.out = ns.out + [ns.cur] -%}
+      {% set ns.cur = {} -%}
+      {% endif -%}
+      {% endfor -%}
+      {{ ns.out }}
+
+- name: Services | query ctrl-alt-del.target mask (alias of reboot.target, so probe the symlink)
+  ansible.builtin.stat:
+    path: /etc/systemd/system/ctrl-alt-del.target
+  register: harden_svc_cad_probe
+
+- name: Services | classify units
+  ansible.builtin.set_fact:
+    harden_svc_to_mask: >-
+      {{ harden_svc_state | selectattr('Id', 'in', harden_svc_units)
+         | selectattr('LoadState', 'equalto', 'loaded')
+         | rejectattr('ActiveState', 'in', ['active', 'activating', 'reloading', 'deactivating'])
+         | list }}
+    harden_svc_running: >-
+      {{ harden_svc_state | selectattr('Id', 'in', harden_svc_units)
+         | selectattr('LoadState', 'equalto', 'loaded')
+         | selectattr('ActiveState', 'in', ['active', 'activating', 'reloading', 'deactivating'])
+         | map(attribute='Id') | list }}
+    harden_svc_cad: >-
+      {{ {'Id': 'ctrl-alt-del.target',
+          'LoadState': 'masked' if (harden_svc_cad_probe.stat.lnk_source | default('')) == '/dev/null' else 'loaded',
+          'UnitFileState': 'masked' if (harden_svc_cad_probe.stat.lnk_source | default('')) == '/dev/null' else 'static', 'ActiveState': 'inactive'} }}
+    harden_svc_chrony: >-
+      {{ harden_svc_state | selectattr('Id', 'equalto', harden_chrony_service ~ '.service') | first | default({}) }}
+
+- name: Services | warn about running unwanted services
+  ansible.builtin.include_tasks: _warn.yml
+  vars:
+    harden_warn_msg: "active, not stopped (disable manually if unused): {{ harden_svc_running | join(', ') }}"
+  when: harden_svc_running | length > 0
+
+- name: Services | record previous unit states
+  ansible.builtin.include_tasks: _unit_record.yml
+  vars:
+    harden_unit_name: "{{ harden_svc_item.Id }}"
+    harden_unit_enabled: "{{ harden_svc_item.UnitFileState }}"
+    harden_unit_active: "{{ harden_svc_item.ActiveState }}"
+  loop: >-
+    {{ harden_svc_to_mask + ([harden_svc_cad] if harden_svc_cad.LoadState | default('') == 'loaded' else []) }}
+  loop_control:
+    loop_var: harden_svc_item
+    label: "{{ harden_svc_item.Id }}"
+
+- name: Services | disable inactive unwanted units
+  ansible.builtin.systemd_service:
+    name: "{{ item.Id }}"
+    enabled: false
+  loop: "{{ harden_svc_to_mask | selectattr('UnitFileState', 'in', ['enabled', 'enabled-runtime']) | list }}"
+  loop_control:
+    label: "{{ item.Id }}"
+  register: harden_svc_disable
+
+- name: Services | mask inactive unwanted units
+  ansible.builtin.systemd_service:
+    name: "{{ item.Id }}"
+    masked: true
+  loop: "{{ harden_svc_to_mask }}"
+  loop_control:
+    label: "{{ item.Id }}"
+  register: harden_svc_mask
+
+# Equivalent to `systemctl mask`, which refuses when /etc already holds the
+# preset alias symlink (Fedora/RHEL); /usr/lib keeps its own alias for restore.
+- name: Services | mask ctrl-alt-del.target
+  ansible.builtin.file:
+    path: /etc/systemd/system/ctrl-alt-del.target
+    src: /dev/null
+    state: link
+    force: true
+  register: harden_svc_cad_mask
+  when: harden_svc_cad.LoadState | default('') == 'loaded'
+
+- name: Services | reload systemd after masking ctrl-alt-del.target
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: harden_svc_cad.LoadState | default('') == 'loaded'
+
+- name: Services | warn when chrony is missing
+  ansible.builtin.include_tasks: _warn.yml
+  vars:
+    harden_warn_msg: "{{ harden_chrony_service }}.service not found (chrony not installed)"
+  when: harden_svc_chrony.LoadState | default('') != 'loaded'
+
+- name: Services | enable and start chrony
+  ansible.builtin.systemd_service:
+    name: "{{ harden_chrony_service }}"
+    enabled: true
+    state: started
+  register: harden_svc_chrony_on
+  when: harden_svc_chrony.LoadState | default('') == 'loaded'
+
+- name: Services | record group result
+  ansible.builtin.include_tasks: _record.yml
+  vars:
+    harden_rec_regs:
+      - "{{ harden_svc_disable | default({}) }}"
+      - "{{ harden_svc_mask | default({}) }}"
+      - "{{ harden_svc_cad_mask | default({}) }}"
+      - "{{ harden_svc_chrony_on | default({}) }}"

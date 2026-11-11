@@ -1,0 +1,32 @@
+---
+# Internal: record the previous state of a systemd unit before changing it,
+# as "unit <name> <UnitFileState> <ActiveState>" in the manifest.
+# Inputs: harden_unit_name, harden_unit_enabled, harden_unit_active
+- name: Unit record | ensure backup directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop:
+    - "{{ harden_backup_root }}"
+    - "{{ harden_backup_dir }}"
+  when: ('unit:' ~ harden_unit_name) not in harden_backed_up
+  tags: [always]
+
+- name: Unit record | add manifest line
+  ansible.builtin.lineinfile:
+    path: "{{ harden_backup_dir }}/manifest"
+    line: "unit {{ harden_unit_name }} {{ harden_unit_enabled | default('unknown', true) }} {{ harden_unit_active | default('unknown', true) }}"
+    create: true
+    owner: root
+    group: root
+    mode: "0600"
+  when: ('unit:' ~ harden_unit_name) not in harden_backed_up
+  tags: [always]
+
+- name: Unit record | remember unit
+  ansible.builtin.set_fact:
+    harden_backed_up: "{{ harden_backed_up + ['unit:' ~ harden_unit_name] }}"
+  tags: [always]

@@ -1,0 +1,106 @@
+---
+# Defaults for the hardening role. Variable names/defaults mirror docs/SPEC.md
+# (shell HARDEN_FOO == ansible harden_foo). Lists are YAML lists here; the
+# shell implementation uses space-separated strings.
+
+# ---------------------------------------------------------------------------
+# Group toggles (safety rule 8). Set any to false to skip that control group.
+# ---------------------------------------------------------------------------
+harden_packages: true
+harden_updates: true
+harden_ssh: true
+harden_firewall: true
+harden_fail2ban: true
+harden_sysctl: true
+harden_modules: true
+harden_auditd: true
+harden_accounts: true
+harden_fileperms: true
+harden_services: true
+harden_mac: true
+harden_logging: true
+harden_banner: true
+
+# ---------------------------------------------------------------------------
+# SSH
+# ---------------------------------------------------------------------------
+# Port sshd listens on. Changing it is wrapped in the auto-rollback and the
+# play reconnects on the new port (ansible_port is updated for this run only;
+# update your inventory afterwards).
+harden_ssh_port: 22
+# Users for "AllowUsers". Empty -> no AllowUsers line. Every name must exist,
+# otherwise the ssh group is aborted.
+harden_ssh_allow_users: []
+# Disable password/keyboard-interactive auth even when no key-capable sudo
+# user was detected (safety rule 1). Only set this if you know better.
+harden_force_key_only: false
+# CIDRs. If set, SSH is only allowed from these in the firewall; also added
+# to fail2ban ignoreip.
+harden_admin_sources: []
+
+# ---------------------------------------------------------------------------
+# Firewall
+# ---------------------------------------------------------------------------
+# Extra inbound ports (SSH is always allowed).
+harden_allowed_tcp_ports: []
+harden_allowed_udp_ports: []
+# Enable the firewall even if listening sockets exist on ports that are not
+# allowlisted (safety rule 2). Those services become unreachable.
+harden_firewall_force: false
+# Listening sockets ("proto/port") ignored by the safety-rule-2 precheck
+# (mDNS/LLMNR, e.g. systemd-resolved; blocking them is intended).
+harden_firewall_ignore_listeners: ["udp/5353", "tcp/5355", "udp/5355"]
+# Seconds before an unconfirmed SSH/firewall change is rolled back by the
+# transient systemd timer "hardening-rollback-<group>" (safety rule 3).
+harden_rollback_seconds: 120
+
+# ---------------------------------------------------------------------------
+# sysctl
+# ---------------------------------------------------------------------------
+harden_disable_ipv6: false
+# Opt-in: net.ipv6.conf.{all,default}.accept_ra = 0 (breaks SLAAC / cloud v6).
+harden_ipv6_accept_ra_off: false
+# kernel.kexec_load_disabled = 1 (breaks kdump).
+harden_kexec_disable: false
+
+# ---------------------------------------------------------------------------
+# Updates
+# ---------------------------------------------------------------------------
+# Apply all pending updates during the packages group.
+harden_apply_updates: true
+# Let the automatic update tooling reboot when required.
+harden_auto_reboot: false
+harden_auto_reboot_time: "04:00"
+
+# ---------------------------------------------------------------------------
+# fail2ban
+# ---------------------------------------------------------------------------
+harden_fail2ban_bantime: 1h
+harden_fail2ban_maxretry: 5
+# Added to "127.0.0.1/8 ::1" and harden_admin_sources.
+harden_fail2ban_ignoreip: []
+
+# ---------------------------------------------------------------------------
+# auditd
+# ---------------------------------------------------------------------------
+# Append "-e 2" (rules immutable until reboot).
+harden_audit_immutable: false
+# Comment out "-a task,never" (Fedora default) in other rules.d files.
+harden_audit_fix_task_never: false
+
+# ---------------------------------------------------------------------------
+# MAC
+# ---------------------------------------------------------------------------
+# Switch SELinux permissive -> enforcing even if recent AVC denials exist.
+harden_selinux_force: false
+
+# ---------------------------------------------------------------------------
+# Internal (normally not changed)
+# ---------------------------------------------------------------------------
+# Shared lists consumed verbatim by both implementations (repo-root data/).
+harden_data_dir: "{{ role_path ~ '/../../../data' }}"
+# Backups: <root>/<timestamp>/<original path> + manifest (safety rule 4).
+harden_backup_root: /var/backups/linux-hardening
+# Timestamp to restore with restore.yml (directory name under
+# harden_backup_root, e.g. 20261111-142233).
+harden_restore_timestamp: ""

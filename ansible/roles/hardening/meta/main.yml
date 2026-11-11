@@ -1,0 +1,26 @@
+---
+galaxy_info:
+  role_name: hardening
+  namespace: linux_hardening
+  author: Brett
+  description: >-
+    Linux server hardening (SSH, firewall, fail2ban, sysctl, auditd, accounts, file permissions,
+    services, MAC, logging, banner) with backups, auto-rollback and verify/restore playbooks.
+    Uses ansible.builtin modules only. Contract: docs/SPEC.md.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions: [bookworm, trixie]
+    - name: Ubuntu
+      versions: [jammy, noble]
+    - name: EL
+      versions: ["9", "10"]
+    - name: Fedora
+      versions: [all]
+    - name: opensuse
+      versions: [all]
+    - name: SLES
+      versions: ["15", "16"]
+  galaxy_tags: [security, hardening, ssh, firewall, cis]
+dependencies: []

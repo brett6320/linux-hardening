@@ -1,0 +1,61 @@
+---
+# End of play: per-group changed/ok/skipped/warning + reboot-required.
+- name: Summary | run pending handlers before reporting
+  ansible.builtin.meta: flush_handlers
+
+- name: Summary | check reboot-required flag (debian)
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: harden_sum_reboot_deb
+  when: harden_family == 'debian'
+
+- name: Summary | check needs-restarting (rhel)
+  ansible.builtin.command:
+    argv: [dnf, -q, needs-restarting, -r]
+  register: harden_sum_reboot_rhel
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: harden_family == 'rhel'
+
+- name: Summary | check zypper needs-rebooting (suse)
+  ansible.builtin.command:
+    argv: [zypper, needs-rebooting]
+  register: harden_sum_reboot_suse
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: harden_family == 'suse'
+
+- name: Summary | evaluate reboot requirement
+  ansible.builtin.set_fact:
+    harden_reboot_required: >-
+      {{ (harden_family == 'debian' and harden_sum_reboot_deb.stat.exists | default(false))
+         or (harden_family == 'rhel' and harden_sum_reboot_rhel.rc | default(0) == 1)
+         or (harden_family == 'suse' and harden_sum_reboot_suse.rc | default(0) == 102)
+         or harden_reboot_reasons | length > 0 }}
+
+- name: Summary | per-group results
+  ansible.builtin.debug:
+    msg: >-
+      {% set ns = namespace(lines=[]) -%}
+      {% for g in ['packages', 'updates', 'ssh', 'firewall', 'fail2ban', 'sysctl', 'modules', 'auditd',
+                   'accounts', 'fileperms', 'services', 'mac', 'logging', 'banner'] if g in harden_report -%}
+      {% set r = harden_report[g] -%}
+      {% set ns.lines = ns.lines + [g ~ ': ' ~ r.status
+           ~ (' (' ~ r.reason ~ ')' if r.reason | length > 0 else '')
+           ~ (' [changed]' if r.changed and r.status != 'changed' else '')
+           ~ (' - ' ~ (r.warnings | join('; ')) if r.warnings | length > 0 else '')] -%}
+      {% endfor -%}
+      {{ {'groups': ns.lines,
+          'reboot_required': harden_reboot_required | bool,
+          'reboot_reasons': harden_reboot_reasons,
+          'backup': harden_backup_dir if harden_backed_up | length > 0 else 'none (nothing changed)'} }}
+
+- name: Summary | fail when a group failed
+  ansible.builtin.assert:
+    that: harden_report | dict2items | selectattr('value.status', 'equalto', 'failed') | list | length == 0
+    fail_msg: >-
+      Failed groups: {{ harden_report | dict2items | selectattr('value.status', 'equalto', 'failed')
+                        | map(attribute='key') | join(', ') }} (changes were rolled back, see above).
+    quiet: true

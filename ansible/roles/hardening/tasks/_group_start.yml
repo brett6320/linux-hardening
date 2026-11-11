@@ -1,0 +1,9 @@
+---
+# Internal: reset per-group state. Input: harden_grp_name
+- name: Group | start
+  ansible.builtin.set_fact:
+    harden_grp: "{{ harden_grp_name }}"
+    harden_grp_changed: false
+    harden_grp_skip: ""
+    harden_grp_failed: ""
+  tags: [always]

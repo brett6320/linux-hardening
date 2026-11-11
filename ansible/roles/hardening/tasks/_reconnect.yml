@@ -1,0 +1,13 @@
+---
+# Internal: prove that a brand-new SSH connection still works.
+# meta tasks do not support "when", so this file is only included when needed.
+- name: Reconnect | drop the persistent connection
+  ansible.builtin.meta: reset_connection
+  tags: [always]
+
+- name: Reconnect | open a new connection
+  ansible.builtin.wait_for_connection:
+    delay: 2
+    sleep: 3
+    timeout: "{{ [(harden_rollback_seconds | int) - 20, 15] | max }}"
+  tags: [always]

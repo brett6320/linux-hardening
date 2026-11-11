@@ -1,0 +1,23 @@
+---
+# Control group: modules (SPEC "modules").
+- name: Modules | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: modules
+
+- name: Modules | write /etc/modprobe.d/00-hardening.conf
+  ansible.builtin.include_tasks: _file.yml
+  vars:
+    harden_f:
+      path: /etc/modprobe.d/00-hardening.conf
+      content: |
+        # Managed by linux-hardening (ansible role "hardening"). Local edits are overwritten.
+        # Source: data/modules.list
+        {% for m in lookup('ansible.builtin.file', harden_data_dir ~ '/modules.list').splitlines() | map('trim')
+             if m | length > 0 and not m is match('^#') %}
+        install {{ m }} /bin/false
+        blacklist {{ m }}
+        {% endfor %}
+
+- name: Modules | record group result
+  ansible.builtin.include_tasks: _record.yml

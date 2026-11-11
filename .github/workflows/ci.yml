@@ -15,6 +15,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck
         run: shellcheck -x -S style scripts/harden.sh scripts/lib/*.sh tests/container/run.sh
+      - name: Install ansible-lint
+        run: pipx install ansible-lint && pipx inject ansible-lint ansible-core
+      - name: ansible-lint
+        working-directory: ansible
+        run: ansible-lint
+      - name: Syntax check
+        working-directory: ansible
+        run: for pb in site.yml verify.yml restore.yml; do ansible-playbook -i localhost, --syntax-check "$pb"; done
 
   container:
     needs: lint
@@ -22,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [shell]
+        mode: [shell, ansible]
         image:
           - debian:12
           - debian:13

@@ -1,0 +1,19 @@
+---
+# Control group: banner (SPEC "banner"). /etc/motd is left untouched.
+- name: Banner | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: banner
+
+- name: Banner | write /etc/issue and /etc/issue.net
+  ansible.builtin.include_tasks: _file.yml
+  vars:
+    harden_f:
+      path: "{{ harden_banner_item }}"
+      content: "{{ lookup('ansible.builtin.file', harden_data_dir ~ '/issue.net') }}\n"
+  loop: [/etc/issue, /etc/issue.net]
+  loop_control:
+    loop_var: harden_banner_item
+
+- name: Banner | record group result
+  ansible.builtin.include_tasks: _record.yml

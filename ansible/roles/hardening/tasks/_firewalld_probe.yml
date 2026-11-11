@@ -1,0 +1,89 @@
+---
+# Internal: compare firewalld state with the desired "drop" zone setup and
+# compute the firewall-cmd invocations still needed.
+# Output facts: harden_fwd_perm_cmds, harden_fwd_if_cmds, harden_fwd_set_default,
+#               harden_fwd_old_zones, harden_fwd_pending
+- name: Firewalld probe | read default zone
+  ansible.builtin.command:
+    argv: [firewall-cmd, --get-default-zone]
+  register: harden_fwd_def
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  tags: [always]
+
+- name: Firewalld probe | read permanent drop zone settings
+  ansible.builtin.command:
+    argv: [firewall-cmd, --permanent, --zone=drop, "--list-{{ item }}"]
+  loop: [ports, services, protocols, rich-rules]
+  register: harden_fwd_list
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  tags: [always]
+
+- name: Firewalld probe | read runtime zone of default-route interfaces
+  ansible.builtin.command:
+    argv: [firewall-cmd, "--get-zone-of-interface={{ item }}"]
+  loop: "{{ harden_fw_ifaces }}"
+  register: harden_fwd_ifzone
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  tags: [always]
+
+- name: Firewalld probe | compute pending changes
+  ansible.builtin.set_fact:
+    harden_fwd_perm_cmds: >-
+      {% set cur_ports = harden_fwd_list.results[0].stdout | default('') | split -%}
+      {% set cur_svcs = harden_fwd_list.results[1].stdout | default('') | split -%}
+      {% set cur_protos = harden_fwd_list.results[2].stdout | default('') | split -%}
+      {% set cur_rich = harden_fwd_list.results[3].stdout_lines | default([]) | map('trim') | list -%}
+      {% set ssh_plain = (harden_ssh_port | string) ~ '/tcp' -%}
+      {% set want_ports = ([] if harden_admin_sources | length > 0 else [ssh_plain])
+           + (harden_allowed_tcp_ports | map('string') | map('regex_replace', '$', '/tcp') | list)
+           + (harden_allowed_udp_ports | map('string') | map('regex_replace', '$', '/udp') | list) -%}
+      {% set ns = namespace(cmds=[]) -%}
+      {% for p in want_ports if p not in cur_ports -%}
+      {% set ns.cmds = ns.cmds + [['firewall-cmd', '--permanent', '--zone=drop', '--add-port=' ~ p]] -%}
+      {% endfor -%}
+      {% if harden_admin_sources | length > 0 and ssh_plain in cur_ports -%}
+      {% set ns.cmds = ns.cmds + [['firewall-cmd', '--permanent', '--zone=drop', '--remove-port=' ~ ssh_plain]] -%}
+      {% endif -%}
+      {% for s in ['dhcpv6-client'] if s not in cur_svcs -%}
+      {% set ns.cmds = ns.cmds + [['firewall-cmd', '--permanent', '--zone=drop', '--add-service=' ~ s]] -%}
+      {% endfor -%}
+      {% for p in ['icmp', 'ipv6-icmp'] if p not in cur_protos -%}
+      {% set ns.cmds = ns.cmds + [['firewall-cmd', '--permanent', '--zone=drop', '--add-protocol=' ~ p]] -%}
+      {% endfor -%}
+      {% for src in harden_admin_sources -%}
+      {% set rule = 'rule family="' ~ ('ipv6' if ':' in src else 'ipv4') ~ '" source address="' ~ src
+           ~ '" port port="' ~ harden_ssh_port ~ '" protocol="tcp" accept' -%}
+      {% if rule not in cur_rich -%}
+      {% set ns.cmds = ns.cmds + [['firewall-cmd', '--permanent', '--zone=drop', '--add-rich-rule=' ~ rule]] -%}
+      {% endif -%}
+      {% endfor -%}
+      {% for r in harden_fwd_ifzone.results | default([]) if (r.stdout | default('') | trim) != 'drop' -%}
+      {% set ns.cmds = ns.cmds + [['firewall-cmd', '--permanent', '--zone=drop', '--change-interface=' ~ r.item]] -%}
+      {% endfor -%}
+      {{ ns.cmds }}
+    harden_fwd_if_cmds: >-
+      {% set ns = namespace(cmds=[]) -%}
+      {% for r in harden_fwd_ifzone.results | default([]) if (r.stdout | default('') | trim) != 'drop' -%}
+      {% set ns.cmds = ns.cmds + [['firewall-cmd', '--zone=drop', '--change-interface=' ~ r.item]] -%}
+      {% endfor -%}
+      {{ ns.cmds }}
+    harden_fwd_old_zones: >-
+      {% set ns = namespace(d={}) -%}
+      {% for r in harden_fwd_ifzone.results | default([]) if r.rc | default(1) == 0 and (r.stdout | trim) != 'drop' -%}
+      {% set ns.d = ns.d | combine({r.item: r.stdout | trim}) -%}
+      {% endfor -%}
+      {{ ns.d }}
+    harden_fwd_set_default: "{{ (harden_fwd_def.stdout | default('') | trim) != 'drop' }}"
+  tags: [always]
+
+- name: Firewalld probe | summarise
+  ansible.builtin.set_fact:
+    harden_fwd_pending: >-
+      {{ harden_fwd_perm_cmds | length > 0 or harden_fwd_if_cmds | length > 0 or harden_fwd_set_default | bool }}
+  tags: [always]

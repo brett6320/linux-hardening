@@ -1,0 +1,45 @@
+---
+# Control group: logging (SPEC "logging").
+- name: Logging | start group
+  ansible.builtin.include_tasks: _group_start.yml
+  vars:
+    harden_grp_name: logging
+
+- name: Logging | journald drop-in
+  ansible.builtin.include_tasks: _file.yml
+  vars:
+    harden_f:
+      path: /etc/systemd/journald.conf.d/99-hardening.conf
+      content: |
+        # Managed by linux-hardening (ansible role "hardening").
+        [Journal]
+        Storage=persistent
+        Compress=yes
+        SystemMaxUse=1G
+
+- name: Logging | restart journald when configuration changed
+  ansible.builtin.debug:
+    msg: journald configuration changed, restart scheduled
+  changed_when: true
+  notify: Restart journald
+  when: "'/etc/systemd/journald.conf.d/99-hardening.conf' in harden_changed_files"
+
+- name: Logging | rsyslog file mode
+  ansible.builtin.include_tasks: _file.yml
+  vars:
+    harden_f:
+      path: /etc/rsyslog.d/99-hardening.conf
+      content: |
+        # Managed by linux-hardening (ansible role "hardening").
+        $FileCreateMode 0640
+  when: "'rsyslog' in ansible_facts['packages']"
+
+- name: Logging | restart rsyslog when configuration changed
+  ansible.builtin.debug:
+    msg: rsyslog configuration changed, restart scheduled
+  changed_when: true
+  notify: Restart rsyslog
+  when: "'/etc/rsyslog.d/99-hardening.conf' in harden_changed_files"
+
+- name: Logging | record group result
+  ansible.builtin.include_tasks: _record.yml

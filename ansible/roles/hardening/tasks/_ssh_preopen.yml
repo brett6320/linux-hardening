@@ -1,0 +1,112 @@
+---
+# Internal: before sshd moves to a new port, allow that port in a firewall
+# that is already active, so the reconnect can succeed. The opening is made
+# persistent (firewalld --permanent, hardening.nft rule) so that a skipped or
+# rolled-back firewall group, a reload or a reboot cannot lock SSH out.
+- name: SSH pre-open | probe firewalld
+  ansible.builtin.command:
+    argv: [firewall-cmd, --state]
+  register: harden_pre_fwd
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  tags: [always]
+
+- name: SSH pre-open | list active firewalld zones
+  ansible.builtin.command:
+    argv: [firewall-cmd, --get-active-zones]
+  register: harden_pre_zones
+  changed_when: false
+  check_mode: false
+  when: harden_pre_fwd.rc == 0
+  tags: [always]
+
+- name: SSH pre-open | read default zone
+  ansible.builtin.command:
+    argv: [firewall-cmd, --get-default-zone]
+  register: harden_pre_defzone
+  changed_when: false
+  check_mode: false
+  when: harden_pre_fwd.rc == 0
+  tags: [always]
+
+- name: SSH pre-open | query port in active and default zones
+  ansible.builtin.command:
+    argv: [firewall-cmd, "--zone={{ item }}", "--query-port={{ harden_ssh_port }}/tcp"]
+  loop: >-
+    {{ (harden_pre_zones.stdout_lines | default([]) | reject('match', '^\s') | reject('equalto', '') | list
+        + [harden_pre_defzone.stdout | default('') | trim]) | reject('equalto', '') | unique | list }}
+  register: harden_pre_q
+  changed_when: false
+  failed_when: harden_pre_q.rc not in [0, 1]
+  check_mode: false
+  when: harden_pre_fwd.rc == 0
+  tags: [always]
+
+- name: SSH pre-open | add port to active zones (runtime)
+  ansible.builtin.command:
+    argv: [firewall-cmd, "--zone={{ item.item }}", "--add-port={{ harden_ssh_port }}/tcp"]
+  loop: "{{ harden_pre_q.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'eq', 1) | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  changed_when: true
+  when: harden_pre_fwd.rc == 0
+  tags: [always]
+
+- name: SSH pre-open | add port to active zones (permanent)
+  ansible.builtin.command:
+    argv: [firewall-cmd, --permanent, "--zone={{ item.item }}", "--add-port={{ harden_ssh_port }}/tcp"]
+  loop: "{{ harden_pre_q.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'eq', 1) | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  changed_when: true
+  when: harden_pre_fwd.rc == 0
+  tags: [always]
+
+- name: SSH pre-open | probe nftables hardening table
+  ansible.builtin.command:
+    argv: [nft, list, table, inet, hardening]
+  register: harden_pre_nft
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  tags: [always]
+
+- name: SSH pre-open | allow port in nftables hardening table (runtime)
+  ansible.builtin.command:
+    argv: [nft, add, rule, inet, hardening, input, tcp, dport, "{{ harden_ssh_port | int }}", accept]
+  changed_when: true
+  when: harden_pre_nft.rc == 0
+  tags: [always]
+
+- name: SSH pre-open | check nftables rules file
+  ansible.builtin.stat:
+    path: /etc/nftables.d/hardening.nft
+  register: harden_pre_nft_file
+  tags: [always]
+
+- name: SSH pre-open | persist port in nftables rules file
+  ansible.builtin.include_tasks: _line.yml
+  vars:
+    harden_l:
+      path: /etc/nftables.d/hardening.nft
+      line: "\t\ttcp dport {{ harden_ssh_port | int }} accept # ssh port pre-opened by ssh group"
+      insertafter: 'policy drop;'
+  when: harden_pre_nft_file.stat.exists
+  tags: [always]
+
+- name: SSH pre-open | probe ufw
+  ansible.builtin.command:
+    argv: [ufw, status]
+  register: harden_pre_ufw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  tags: [always]
+
+- name: SSH pre-open | allow port in ufw
+  ansible.builtin.command:
+    argv: [ufw, allow, "{{ harden_ssh_port | int }}/tcp"]
+  changed_when: true
+  when: harden_pre_ufw.rc | default(1) == 0 and (harden_pre_ufw.stdout | default('')) is search('Status:\s+active')
+  tags: [always]

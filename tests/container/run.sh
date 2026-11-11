@@ -54,10 +54,13 @@ if [[ $mode == shell ]]; then
   fi
   audit
 else
-  docker exec "$name" sh -c 'command -v ansible-playbook >/dev/null || python3 -m pip install -q ansible-core 2>/dev/null || python3 -m pip install -q --break-system-packages ansible-core'
-  pb="ansible-playbook -i localhost, -c local /opt/linux-hardening/ansible/site.yml"
+  # Leap 15.6 ships python 3.6; the image adds python3.11 for ansible-core.
+  py=$(docker exec "$name" sh -c 'command -v python3.11 || command -v python3')
+  docker exec "$name" sh -c "command -v ansible-playbook >/dev/null || $py -m pip install -q ansible-core 2>/dev/null || $py -m pip install -q --break-system-packages ansible-core"
+  pb="ansible-playbook -i localhost, -c local -e ansible_python_interpreter=$py /opt/linux-hardening/ansible/site.yml"
   docker exec -e ANSIBLE_CONFIG=/opt/linux-hardening/ansible/ansible.cfg "$name" sh -c "$pb"
   out=$(docker exec -e ANSIBLE_CONFIG=/opt/linux-hardening/ansible/ansible.cfg "$name" sh -c "$pb" 2>&1)
+  echo "$out" | grep -E '^(TASK|changed)' | grep -B1 '^changed' || true
   echo "$out" | tail -20
   echo "$out" | grep -Eq 'changed=0 ' || { echo "FAIL: ansible not idempotent" >&2; exit 1; }
   # Cross-check: shell audit against the Ansible-hardened host.

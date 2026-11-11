@@ -1,0 +1,19 @@
+---
+# RHEL / Rocky / Alma / CentOS Stream / Fedora specifics.
+harden_ssh_service: sshd
+harden_chrony_service: chronyd
+harden_auditd_package: audit
+harden_firewall_backend: firewalld
+harden_fail2ban_banaction: firewallcmd-rich-rules
+# Fedora 41+ ships dnf5: different automatic-update package/timer and the
+# needs-restarting plugin lives in dnf5-plugins.
+harden_base_packages: >-
+  {{ ['audit', 'chrony', 'firewalld']
+     + (['dnf5-plugins'] if ansible_facts['distribution'] == 'Fedora' else ['dnf-utils', 'dnf-plugins-core']) }}
+harden_fail2ban_packages:
+  - fail2ban
+harden_update_packages: >-
+  {{ ['dnf5-plugin-automatic'] if ansible_facts['distribution'] == 'Fedora' else ['dnf-automatic'] }}
+harden_dnf_automatic_timer: >-
+  {{ 'dnf5-automatic.timer' if ansible_facts['distribution'] == 'Fedora' else 'dnf-automatic.timer' }}
+harden_apparmor_packages: []

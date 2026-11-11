@@ -1,0 +1,33 @@
+---
+# Internal: cancel the pending rollback timer of harden_grp.
+# Strict mode (default) fails if the timer already fired, i.e. the change was
+# rolled back before connectivity was confirmed. Rescue paths pass
+# harden_rb_strict: false.
+- name: Rollback | check that the rollback timer is still pending
+  ansible.builtin.command:
+    argv: [systemctl, is-active, "hardening-rollback-{{ harden_grp }}.timer"]
+  register: harden_rb_active
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+  tags: [always]
+
+- name: Rollback | cancel rollback timer
+  ansible.builtin.command:
+    argv: [systemctl, stop, "hardening-rollback-{{ harden_grp }}.timer"]
+  changed_when: true
+  failed_when: false
+  when: not ansible_check_mode
+  tags: [always]
+
+- name: Rollback | fail if the rollback already ran
+  ansible.builtin.fail:
+    msg: >-
+      The auto-rollback timer for group {{ harden_grp }} fired before connectivity was confirmed
+      (increase harden_rollback_seconds); the change has been rolled back.
+  when:
+    - not ansible_check_mode
+    - harden_rb_strict | default(true) | bool
+    - (harden_rb_active.stdout | default('') | trim) != 'active'
+  tags: [always]

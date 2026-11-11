@@ -1,0 +1,41 @@
+---
+# Detection, run state and pre-recorded "disabled" results.
+- name: Preflight | detect distribution
+  ansible.builtin.include_tasks: _family.yml
+
+- name: Preflight | initialise run state
+  ansible.builtin.set_fact:
+    # One backup directory per run: /var/backups/linux-hardening/<timestamp>
+    harden_timestamp: "{{ now(fmt='%Y%m%d-%H%M%S') }}"
+    harden_backed_up: []
+    harden_backups: {}
+    harden_changed_files: []
+    harden_warn: {}
+    harden_report: {}
+    harden_reboot_reasons: []
+    harden_grp: preflight
+
+- name: Preflight | set backup directory
+  ansible.builtin.set_fact:
+    harden_backup_dir: "{{ harden_backup_root }}/{{ harden_timestamp }}"
+
+- name: Preflight | validate variables
+  ansible.builtin.assert:
+    that:
+      - harden_ssh_port | int > 0 and harden_ssh_port | int < 65536
+      - harden_rollback_seconds | int >= 30
+      - harden_ssh_allow_users is sequence and harden_ssh_allow_users is not string
+      - harden_admin_sources is sequence and harden_admin_sources is not string
+      - harden_allowed_tcp_ports is sequence and harden_allowed_tcp_ports is not string
+      - harden_allowed_udp_ports is sequence and harden_allowed_udp_ports is not string
+      - harden_fail2ban_ignoreip is sequence and harden_fail2ban_ignoreip is not string
+      - harden_auto_reboot_time is match('^[0-2][0-9]:[0-5][0-9]$')
+    fail_msg: Invalid harden_* variable (see roles/hardening/defaults/main.yml).
+    quiet: true
+
+- name: Preflight | record disabled groups
+  ansible.builtin.set_fact:
+    harden_report: >-
+      {{ harden_report | combine({item: {'status': 'skipped', 'changed': false, 'reason': 'disabled', 'warnings': []}}) }}
+  loop: [packages, updates, ssh, firewall, fail2ban, sysctl, modules, auditd, accounts, fileperms, services, mac, logging, banner]
+  when: not lookup('ansible.builtin.vars', 'harden_' ~ item) | bool

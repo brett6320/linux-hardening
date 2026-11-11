@@ -1,0 +1,19 @@
+---
+# Internal: store the current group's result in harden_report.
+# Optional input: harden_rec_regs = list of registered results whose
+# "changed" also counts for the group (tasks not using the helpers).
+- name: Group | record result
+  ansible.builtin.set_fact:
+    harden_report: >-
+      {% set regs_changed = (harden_rec_regs | default([]) | select('mapping') | select('changed') | list | length) > 0 -%}
+      {% set changed = (harden_grp_changed | bool) or regs_changed -%}
+      {% set warns = harden_warn[harden_grp] | default([]) -%}
+      {{ harden_report | combine({harden_grp: {
+           'status': ('failed' if harden_grp_failed | length > 0
+                      else 'skipped' if harden_grp_skip | length > 0
+                      else 'warning' if warns | length > 0
+                      else 'changed' if changed else 'ok'),
+           'changed': changed,
+           'reason': harden_grp_failed if harden_grp_failed | length > 0 else harden_grp_skip,
+           'warnings': warns}}) }}
+  tags: [always]

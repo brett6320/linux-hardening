@@ -1,0 +1,67 @@
+---
+# Internal: enforce mode (and optionally owner/group) on an existing path.
+# Old mode/owner/group go to the manifest as "mode <old> <owner> <group> <path>".
+# Input: harden_p = {path, mode, owner?, group?}
+- name: Perm | stat path
+  ansible.builtin.stat:
+    path: "{{ harden_p.path }}"
+    follow: false
+    get_checksum: false
+  register: harden_p_stat
+  tags: [always]
+
+- name: Perm | enforce when present
+  when: harden_p_stat.stat.exists and not harden_p_stat.stat.islnk
+  tags: [always]
+  block:
+    - name: Perm | predict change
+      ansible.builtin.file:
+        path: "{{ harden_p.path }}"
+        state: "{{ 'directory' if harden_p_stat.stat.isdir else 'file' }}"
+        mode: "{{ harden_p.mode }}"
+        owner: "{{ harden_p.owner | default(omit) }}"
+        group: "{{ harden_p.group | default(omit) }}"
+      check_mode: true
+      register: harden_p_pred
+
+    - name: Perm | evaluate prediction
+      ansible.builtin.set_fact:
+        harden_p_will_change: "{{ harden_p_pred is changed }}"
+
+    - name: Perm | ensure backup directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      loop:
+        - "{{ harden_backup_root }}"
+        - "{{ harden_backup_dir }}"
+      when: harden_p_will_change | bool
+
+    - name: Perm | record previous mode in manifest
+      ansible.builtin.lineinfile:
+        path: "{{ harden_backup_dir }}/manifest"
+        line: >-
+          mode {{ harden_p_stat.stat.mode }} {{ harden_p_stat.stat.pw_name }} {{ harden_p_stat.stat.gr_name }} {{ harden_p.path }}
+        create: true
+        owner: root
+        group: root
+        mode: "0600"
+      when: harden_p_will_change | bool and ('mode:' ~ harden_p.path) not in harden_backed_up
+
+    - name: Perm | apply
+      ansible.builtin.file:
+        path: "{{ harden_p.path }}"
+        state: "{{ 'directory' if harden_p_stat.stat.isdir else 'file' }}"
+        mode: "{{ harden_p.mode }}"
+        owner: "{{ harden_p.owner | default(omit) }}"
+        group: "{{ harden_p.group | default(omit) }}"
+      when: harden_p_will_change | bool
+
+    - name: Perm | track change
+      ansible.builtin.set_fact:
+        harden_grp_changed: true
+        harden_backed_up: "{{ harden_backed_up + ['mode:' ~ harden_p.path] }}"
+      when: harden_p_will_change | bool

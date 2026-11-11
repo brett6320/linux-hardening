@@ -1,0 +1,239 @@
+{#- Evaluates every control read-only; renders a JSON list of
+    {g: group, c: check, r: pass|fail|warn|na, d: detail, line: text}. -#}
+{%- set ns = namespace(out=[]) -%}
+{%- set P = harden_v_p -%}
+{%- set S = harden_v_s -%}
+{%- set F = harden_v_f -%}
+{%- set U = harden_v_unit -%}
+{%- set C = harden_v_sshd -%}
+{%- set active_states = ['active', 'activating', 'reloading'] -%}
+
+{#- ------------------------------------------------------------ packages #}
+{%- set pk = ansible_facts['packages'] -%}
+{%- for p in harden_base_packages -%}
+{%- set ns.out = ns.out + [{'g': 'packages', 'c': 'installed ' ~ p, 'r': 'pass' if p in pk else 'fail', 'd': ''}] -%}
+{%- endfor -%}
+{%- set f2b_may_be_missing = harden_is_rhel_proper or harden_is_sles -%}
+{%- set ns.out = ns.out + [{'g': 'packages', 'c': 'installed fail2ban',
+     'r': 'pass' if 'fail2ban' in pk else ('na' if f2b_may_be_missing else 'fail'),
+     'd': '' if 'fail2ban' in pk else ('EPEL/PackageHub may be unavailable' if f2b_may_be_missing else 'missing')}] -%}
+{%- for p in harden_v_remove -%}
+{%- set ns.out = ns.out + [{'g': 'packages', 'c': 'removed ' ~ p, 'r': 'fail' if p in pk else 'pass', 'd': ''}] -%}
+{%- endfor -%}
+
+{#- ------------------------------------------------------------ updates #}
+{%- if harden_family == 'debian' -%}
+{%- set au = F['/etc/apt/apt.conf.d/20auto-upgrades'] | default('') -%}
+{%- set ns.out = ns.out + [{'g': 'updates', 'c': 'unattended-upgrades daily',
+     'r': 'pass' if au is search('Unattended-Upgrade\\s+"1"') and au is search('Update-Package-Lists\\s+"1"') else 'fail', 'd': '20auto-upgrades'}] -%}
+{%- set ns.out = ns.out + [{'g': 'updates', 'c': 'security-only origins',
+     'r': 'pass' if S['/etc/apt/apt.conf.d/52hardening-unattended'].exists else 'fail', 'd': '52hardening-unattended'}] -%}
+{%- elif harden_family == 'rhel' -%}
+{%- set ac = F['/etc/dnf/automatic.conf'] | default('') -%}
+{%- set want_type = 'default' if harden_is_fedora else 'security' -%}
+{%- set ns.out = ns.out + [{'g': 'updates', 'c': 'automatic.conf',
+     'r': 'pass' if ac is search('(?m)^upgrade_type\\s*=\\s*' ~ want_type) and ac is search('(?m)^apply_updates\\s*=\\s*yes') else 'fail',
+     'd': 'upgrade_type=' ~ want_type ~ ', apply_updates=yes'}] -%}
+{%- set t = U[harden_dnf_automatic_timer] | default({}) -%}
+{%- set ns.out = ns.out + [{'g': 'updates', 'c': harden_dnf_automatic_timer ~ ' enabled',
+     'r': 'pass' if t.UnitFileState | default('') == 'enabled' else 'fail', 'd': t.UnitFileState | default('missing')}] -%}
+{%- else -%}
+{%- set t = U['hardening-autopatch.timer'] | default({}) -%}
+{%- set ns.out = ns.out + [{'g': 'updates', 'c': 'hardening-autopatch.timer enabled',
+     'r': 'pass' if t.UnitFileState | default('') == 'enabled' else 'fail', 'd': t.UnitFileState | default('missing')}] -%}
+{%- endif -%}
+
+{#- ------------------------------------------------------------ ssh #}
+{%- set ns.out = ns.out + [{'g': 'ssh', 'c': 'drop-in 00-hardening.conf',
+     'r': 'pass' if S['/etc/ssh/sshd_config.d/00-hardening.conf'].exists else 'fail', 'd': ''}] -%}
+{%- set want = {'port': harden_ssh_port | string, 'pubkeyauthentication': 'yes', 'permitemptypasswords': 'no',
+                'maxauthtries': '3', 'maxsessions': '4', 'logingracetime': '30', 'clientaliveinterval': '300',
+                'clientalivecountmax': '2', 'x11forwarding': 'no', 'allowagentforwarding': 'no',
+                'allowtcpforwarding': 'no', 'permittunnel': 'no', 'permituserenvironment': 'no', 'usedns': 'no',
+                'loglevel': 'VERBOSE', 'banner': '/etc/issue.net', 'hostbasedauthentication': 'no', 'ignorerhosts': 'yes',
+                'passwordauthentication': 'no', 'kbdinteractiveauthentication': 'no'} -%}
+{%- for k, v in want.items() -%}
+{%- set cur = C[k] | default('unset') -%}
+{%- set ns.out = ns.out + [{'g': 'ssh', 'c': k, 'r': 'pass' if cur == v else 'fail', 'd': 'is ' ~ cur ~ ', want ' ~ v}] -%}
+{%- endfor -%}
+{%- set prl = C['permitrootlogin'] | default('unset') -%}
+{%- set ns.out = ns.out + [{'g': 'ssh', 'c': 'permitrootlogin',
+     'r': 'pass' if prl == 'no' else 'warn',
+     'd': 'is ' ~ prl ~ ('' if prl == 'no' else ' (safety rule 1: no key-capable admin user)')}] -%}
+{%- if harden_ssh_allow_users | length > 0 -%}
+{%- set au = (C['allowusers'] | default('')).split() -%}
+{%- set ns.out = ns.out + [{'g': 'ssh', 'c': 'allowusers',
+     'r': 'pass' if (harden_ssh_allow_users | difference(au)) | length == 0 else 'fail', 'd': au | join(' ')}] -%}
+{%- endif -%}
+{%- if harden_family in ['debian', 'suse'] and not harden_fips -%}
+{%- set allowed = {'kexalgorithms': ['sntrup761x25519-sha512@openssh.com', 'mlkem768x25519-sha256', 'curve25519-sha256', 'curve25519-sha256@libssh.org'],
+                   'ciphers': ['chacha20-poly1305@openssh.com', 'aes256-gcm@openssh.com', 'aes128-gcm@openssh.com'],
+                   'macs': ['hmac-sha2-512-etm@openssh.com', 'hmac-sha2-256-etm@openssh.com']} -%}
+{%- for k, v in allowed.items() -%}
+{%- set cur = (C[k] | default('')).split(',') | reject('equalto', '') | list -%}
+{%- set ns.out = ns.out + [{'g': 'ssh', 'c': k, 'r': 'pass' if cur | length > 0 and (cur | difference(v)) | length == 0 else 'fail',
+     'd': (cur | difference(v)) | join(',')}] -%}
+{%- endfor -%}
+{%- elif harden_family == 'rhel' and not harden_fips -%}
+{%- set pol = P.cryptopol.stdout | default('') | trim -%}
+{%- set ns.out = ns.out + [{'g': 'ssh', 'c': 'crypto-policy', 'r': 'fail' if pol is match('LEGACY') or pol == '' else 'pass', 'd': pol}] -%}
+{%- else -%}
+{%- set ns.out = ns.out + [{'g': 'ssh', 'c': 'crypto', 'r': 'na', 'd': 'FIPS mode'}] -%}
+{%- endif -%}
+
+{#- ------------------------------------------------------------ firewall #}
+{%- if harden_v_ufw_active -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'default deny', 'r': 'na', 'd': 'ufw is active'}] -%}
+{%- elif harden_firewall_backend == 'nftables' -%}
+{%- set ch = P.nft.stdout | default('') -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'table inet hardening policy drop', 'r': 'pass' if ch is search('policy drop') else 'fail', 'd': ''}] -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'ssh port allowed', 'r': 'pass' if ch is search('tcp dport ' ~ harden_ssh_port ~ ' accept') else 'fail', 'd': ''}] -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'rules file', 'r': 'pass' if S['/etc/nftables.d/hardening.nft'].exists else 'fail', 'd': ''}] -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'nftables.conf include',
+     'r': 'pass' if (F['/etc/nftables.conf'] | default('')) is search('include "/etc/nftables.d/\\*\\.nft"') else 'fail', 'd': ''}] -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'nftables enabled', 'r': 'pass' if (U['nftables.service'] | default({})).UnitFileState | default('') == 'enabled' else 'fail', 'd': ''}] -%}
+{%- else -%}
+{%- set fu = U['firewalld.service'] | default({}) -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'firewalld active+enabled',
+     'r': 'pass' if fu.ActiveState | default('') == 'active' and fu.UnitFileState | default('') == 'enabled' else 'fail', 'd': ''}] -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'default zone drop', 'r': 'pass' if (P.fwd_default.stdout | default('') | trim) == 'drop' else 'fail', 'd': P.fwd_default.stdout | default('') | trim}] -%}
+{%- if harden_admin_sources | length > 0 -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'ssh rich rules', 'r': 'pass' if (P.fwd_rich.stdout | default('')) is search('port="' ~ harden_ssh_port ~ '"') else 'fail', 'd': ''}] -%}
+{%- else -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'ssh port allowed', 'r': 'pass' if (harden_ssh_port | string ~ '/tcp') in (P.fwd_ports.stdout | default('')).split() else 'fail', 'd': ''}] -%}
+{%- endif -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'dhcpv6-client', 'r': 'pass' if 'dhcpv6-client' in (P.fwd_services.stdout | default('')).split() else 'fail', 'd': ''}] -%}
+{%- set ns.out = ns.out + [{'g': 'firewall', 'c': 'icmp protocols', 'r': 'pass' if 'icmp' in (P.fwd_protocols.stdout | default('')).split() and 'ipv6-icmp' in (P.fwd_protocols.stdout | default('')).split() else 'fail', 'd': ''}] -%}
+{%- endif -%}
+
+{#- ------------------------------------------------------------ fail2ban #}
+{%- if 'fail2ban' not in pk -%}
+{%- set ns.out = ns.out + [{'g': 'fail2ban', 'c': 'sshd jail', 'r': 'na' if f2b_may_be_missing else 'fail', 'd': 'fail2ban not installed'}] -%}
+{%- else -%}
+{%- set jl = F['/etc/fail2ban/jail.d/99-hardening.local'] | default('') -%}
+{%- set ns.out = ns.out + [{'g': 'fail2ban', 'c': 'jail config', 'r': 'pass' if jl is search('backend\\s*=\\s*systemd') else 'fail', 'd': ''}] -%}
+{%- set ns.out = ns.out + [{'g': 'fail2ban', 'c': 'service active', 'r': 'pass' if (U['fail2ban.service'] | default({})).ActiveState | default('') == 'active' else 'fail', 'd': ''}] -%}
+{%- set ns.out = ns.out + [{'g': 'fail2ban', 'c': 'sshd jail', 'r': 'pass' if P.f2b.rc | default(1) == 0 else 'fail', 'd': ''}] -%}
+{%- endif -%}
+
+{#- ------------------------------------------------------------ sysctl #}
+{%- for kv in harden_v_sysctl -%}
+{%- if kv[0] in harden_v_sysctl_now -%}
+{%- set cur = harden_v_sysctl_now[kv[0]] | regex_replace('\\s+', ' ') -%}
+{%- set ns.out = ns.out + [{'g': 'sysctl', 'c': kv[0], 'r': 'pass' if cur == (kv[1] | regex_replace('\\s+', ' ')) else 'fail', 'd': 'is ' ~ cur ~ ', want ' ~ kv[1]}] -%}
+{%- else -%}
+{%- set ns.out = ns.out + [{'g': 'sysctl', 'c': kv[0], 'r': 'na', 'd': 'not supported by kernel'}] -%}
+{%- endif -%}
+{%- endfor -%}
+
+{#- ------------------------------------------------------------ modules #}
+{%- set mp = F['/etc/modprobe.d/00-hardening.conf'] | default('') -%}
+{%- for m in harden_v_modules -%}
+{%- set ns.out = ns.out + [{'g': 'modules', 'c': m,
+     'r': 'pass' if mp is search('(?m)^install ' ~ (m | regex_escape) ~ ' /bin/false$') and mp is search('(?m)^blacklist ' ~ (m | regex_escape) ~ '$') else 'fail', 'd': ''}] -%}
+{%- endfor -%}
+
+{#- ------------------------------------------------------------ auditd #}
+{%- set ad = U['auditd.service'] | default({}) -%}
+{%- set ns.out = ns.out + [{'g': 'auditd', 'c': 'auditd active', 'r': 'pass' if ad.ActiveState | default('') == 'active' else 'fail', 'd': ''}] -%}
+{%- set ns.out = ns.out + [{'g': 'auditd', 'c': 'rules file', 'r': 'pass' if '/etc/audit/rules.d/99-hardening.rules' in F else 'fail', 'd': ''}] -%}
+{%- set ns.out = ns.out + [{'g': 'auditd', 'c': 'rules loaded', 'r': 'pass' if (P.auditctl.stdout | default('')) is search('identity') else 'fail', 'd': 'auditctl -l'}] -%}
+{%- if harden_audit_immutable -%}
+{%- set ns.out = ns.out + [{'g': 'auditd', 'c': 'immutable', 'r': 'pass' if (F['/etc/audit/rules.d/99-hardening.rules'] | default('')) is search('(?m)^-e 2') else 'fail', 'd': ''}] -%}
+{%- endif -%}
+
+{#- ------------------------------------------------------------ accounts #}
+{%- for k, v in {'PASS_MAX_DAYS': '365', 'PASS_MIN_DAYS': '1', 'PASS_WARN_AGE': '14', 'UMASK': '027'}.items() -%}
+{%- set cur = harden_v_logindefs | select('match', '\\s*' ~ k ~ '\\s') | map('regex_replace', '^\\s*\\S+\\s+(\\S+).*$', '\\1') | list | last | default('unset') -%}
+{%- set ns.out = ns.out + [{'g': 'accounts', 'c': 'login.defs ' ~ k, 'r': 'pass' if cur == v else 'fail', 'd': 'is ' ~ cur}] -%}
+{%- endfor -%}
+{%- set enc = harden_v_logindefs | select('match', '\\s*ENCRYPT_METHOD\\s') | map('regex_replace', '^\\s*\\S+\\s+(\\S+).*$', '\\1') | list | last | default('unset') -%}
+{%- set ns.out = ns.out + [{'g': 'accounts', 'c': 'login.defs ENCRYPT_METHOD', 'r': 'pass' if enc | upper in ['YESCRYPT', 'SHA512'] else 'fail', 'd': 'is ' ~ enc}] -%}
+{%- if harden_family == 'rhel' -%}
+{%- set fl = F['/etc/security/faillock.conf'] | default('') -%}
+{%- for k, v in {'deny': '5', 'unlock_time': '900', 'fail_interval': '900'}.items() -%}
+{%- set ns.out = ns.out + [{'g': 'accounts', 'c': 'faillock ' ~ k, 'r': 'pass' if fl is search('(?m)^\\s*' ~ k ~ '\\s*=\\s*' ~ v ~ '\\s*$') else 'fail', 'd': ''}] -%}
+{%- endfor -%}
+{%- else -%}
+{%- set ns.out = ns.out + [{'g': 'accounts', 'c': 'faillock', 'r': 'na', 'd': 'PAM not wired on ' ~ harden_family}] -%}
+{%- endif -%}
+{%- for f in ['/etc/security/limits.d/99-hardening.conf', '/etc/systemd/coredump.conf.d/99-hardening.conf', '/etc/sudoers.d/99-hardening', '/etc/logrotate.d/hardening-sudo'] -%}
+{%- set ns.out = ns.out + [{'g': 'accounts', 'c': f, 'r': 'pass' if S[f].exists else 'fail', 'd': ''}] -%}
+{%- endfor -%}
+
+{#- ------------------------------------------------------------ fileperms #}
+{%- for f in ['/etc/shadow', '/etc/gshadow'] -%}
+{%- if S[f].exists -%}
+{%- set m = S[f].mode -%}
+{%- set ns.out = ns.out + [{'g': 'fileperms', 'c': f, 'r': 'pass' if m[-1] == '0' and m[-2] in ['0', '1', '4', '5'] else 'fail', 'd': 'mode ' ~ m}] -%}
+{%- endif -%}
+{%- endfor -%}
+{%- for f, want_mode in {'/etc/passwd': '0644', '/etc/group': '0644', '/etc/crontab': '0600', '/etc/cron.d': '0700', '/etc/cron.daily': '0700',
+                         '/etc/cron.hourly': '0700', '/etc/cron.weekly': '0700', '/etc/cron.monthly': '0700',
+                         '/boot/grub/grub.cfg': '0600', '/boot/grub2/grub.cfg': '0600'}.items() if S[f].exists -%}
+{%- set ns.out = ns.out + [{'g': 'fileperms', 'c': f, 'r': 'pass' if S[f].mode == want_mode else 'fail', 'd': 'mode ' ~ S[f].mode}] -%}
+{%- endfor -%}
+{%- for k in harden_v_hostkeys.files -%}
+{%- set want_mode = '0644' if k.path is search('\\.pub$') else ('0640' if k.gr_name == 'ssh_keys' else '0600') -%}
+{%- set ns.out = ns.out + [{'g': 'fileperms', 'c': k.path, 'r': 'pass' if k.mode == want_mode else 'fail', 'd': 'mode ' ~ k.mode}] -%}
+{%- endfor -%}
+{%- set mnts = (F['/proc/self/mounts'] | default('')).splitlines() -%}
+{%- set shm_m = (mnts | select('match', '^\\S+ /dev/shm ') | list | last | default('- - - -')).split() -%}
+{%- set tmp_m = (mnts | select('match', '^\\S+ /tmp ') | list | last | default('- - - -')).split() -%}
+{%- set shm = shm_m[3].split(',') -%}
+{%- set ns.out = ns.out + [{'g': 'fileperms', 'c': '/dev/shm nodev,nosuid,noexec', 'r': 'pass' if (['nodev', 'nosuid', 'noexec'] | difference(shm)) | length == 0 else 'fail', 'd': shm | join(',')}] -%}
+{%- if (P.tmp_unit.stdout | default('') | trim) == 'active' and tmp_m[2] == 'tmpfs' -%}
+{%- set tmo = tmp_m[3].split(',') -%}
+{%- set ns.out = ns.out + [{'g': 'fileperms', 'c': '/tmp nosuid,nodev', 'r': 'pass' if (['nosuid', 'nodev'] | difference(tmo)) | length == 0 else 'fail', 'd': tmo | join(',')}] -%}
+{%- else -%}
+{%- set ns.out = ns.out + [{'g': 'fileperms', 'c': '/tmp', 'r': 'na', 'd': 'not a tmpfs managed by tmp.mount'}] -%}
+{%- endif -%}
+
+{#- ------------------------------------------------------------ services #}
+{%- for u in harden_v_units -%}
+{%- set st = U[u] | default({}) -%}
+{%- if st.LoadState | default('not-found') == 'masked' -%}
+{%- set ns.out = ns.out + [{'g': 'services', 'c': u, 'r': 'pass', 'd': 'masked'}] -%}
+{%- elif st.LoadState | default('not-found') != 'loaded' -%}
+{%- set ns.out = ns.out + [{'g': 'services', 'c': u, 'r': 'na', 'd': 'not present'}] -%}
+{%- elif st.ActiveState | default('') in active_states -%}
+{%- set ns.out = ns.out + [{'g': 'services', 'c': u, 'r': 'warn', 'd': 'active (never stopped automatically)'}] -%}
+{%- else -%}
+{%- set ns.out = ns.out + [{'g': 'services', 'c': u, 'r': 'fail', 'd': 'present, inactive, not masked'}] -%}
+{%- endif -%}
+{%- endfor -%}
+{%- set ns.out = ns.out + [{'g': 'services', 'c': 'ctrl-alt-del.target masked', 'r': 'pass' if (U['ctrl-alt-del.target'] | default({})).LoadState | default('') == 'masked' else 'fail', 'd': ''}] -%}
+{%- set ch = U[harden_chrony_service ~ '.service'] | default({}) -%}
+{%- set ns.out = ns.out + [{'g': 'services', 'c': harden_chrony_service ~ ' active', 'r': 'pass' if ch.ActiveState | default('') == 'active' else 'fail', 'd': ''}] -%}
+
+{#- ------------------------------------------------------------ mac #}
+{%- if harden_v_selinux -%}
+{%- set se = P.getenforce.stdout | default('') | trim -%}
+{%- set ns.out = ns.out + [{'g': 'mac', 'c': 'selinux enforcing', 'r': 'pass' if se == 'Enforcing' else 'fail', 'd': se}] -%}
+{%- else -%}
+{%- set ns.out = ns.out + [{'g': 'mac', 'c': 'apparmor enabled', 'r': 'pass' if (P.aa.stdout | default('') | trim) == 'Yes' else 'fail', 'd': P.aa.stdout | default('') | trim}] -%}
+{%- endif -%}
+
+{#- ------------------------------------------------------------ logging #}
+{%- set jd = F['/etc/systemd/journald.conf.d/99-hardening.conf'] | default('') -%}
+{%- set ns.out = ns.out + [{'g': 'logging', 'c': 'journald persistent', 'r': 'pass' if jd is search('(?m)^Storage=persistent') else 'fail', 'd': ''}] -%}
+{%- if 'rsyslog' in pk -%}
+{%- set ns.out = ns.out + [{'g': 'logging', 'c': 'rsyslog FileCreateMode', 'r': 'pass' if S['/etc/rsyslog.d/99-hardening.conf'].exists else 'fail', 'd': ''}] -%}
+{%- else -%}
+{%- set ns.out = ns.out + [{'g': 'logging', 'c': 'rsyslog', 'r': 'na', 'd': 'not installed'}] -%}
+{%- endif -%}
+
+{#- ------------------------------------------------------------ banner #}
+{%- for f in ['/etc/issue', '/etc/issue.net'] -%}
+{%- set ns.out = ns.out + [{'g': 'banner', 'c': f, 'r': 'pass' if (F[f] | default('') | trim) == harden_v_banner else 'fail', 'd': ''}] -%}
+{%- endfor -%}
+
+{#- ------------------------------------------------------------ finish #}
+{%- set fin = namespace(out=[]) -%}
+{%- for e in ns.out -%}
+{%- set r = e.r if lookup('ansible.builtin.vars', 'harden_' ~ e.g) | bool else 'na' -%}
+{%- set d = e.d if lookup('ansible.builtin.vars', 'harden_' ~ e.g) | bool else 'group disabled' -%}
+{%- set fin.out = fin.out + [{'g': e.g, 'c': e.g ~ '.' ~ e.c, 'r': r, 'd': d,
+     'line': (r | upper) ~ ' ' ~ e.g ~ ': ' ~ e.c ~ (' (' ~ d ~ ')' if d | length > 0 else '')}] -%}
+{%- endfor -%}
+{{ fin.out | to_json }}

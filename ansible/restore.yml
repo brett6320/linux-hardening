@@ -1,0 +1,13 @@
+---
+# Revert a hardening run from its backup (mirrors "harden.sh --restore <timestamp>").
+#   ansible-playbook restore.yml -e harden_restore_timestamp=20261111-142233
+# Backups live in /var/backups/linux-hardening/<timestamp>/ on each host.
+- name: Restore Linux hardening backup
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Restore backup
+      ansible.builtin.include_role:
+        name: hardening
+        tasks_from: restore.yml
