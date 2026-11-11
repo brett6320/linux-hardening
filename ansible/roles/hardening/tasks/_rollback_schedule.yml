@@ -56,6 +56,8 @@
       - "--on-active={{ harden_rollback_seconds }}"
       # Without this a fired timer stays "active (elapsed)" and looks pending.
       - --timer-property=RemainAfterElapse=no
+      # The default 1min accuracy can delay the rollback well past the deadline.
+      - --timer-property=AccuracySec=1s
       - "--unit=hardening-rollback-{{ harden_grp }}"
       - /bin/sh
       - "{{ harden_backup_dir }}/rollback-{{ harden_grp }}.sh"
